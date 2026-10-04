@@ -413,9 +413,15 @@ def resolve_order(spec: str, n: int) -> tuple[list[int], list[int]]:
     return given + rest, rest
 
 
+SET_URL_RE = re.compile(r"^(?:https?://)?(?:www\.)?(?:t|telegram)\.me/(?:addemoji|addstickers)/", re.I)
+
+
 def parse_set_ref(ref: str) -> tuple[str, str | None]:
+    """Имя или ссылка t.me/addemoji|addstickers/<имя> (+ «:выбор») → (имя, выбор)."""
     ref = ref.strip()
-    ref = re.sub(r"^https?://t\.me/(addemoji|addstickers)/", "", ref)
+    if SET_URL_RE.match(ref):
+        ref = SET_URL_RE.sub("", ref, count=1)
+        ref = re.split(r"[?#/]", ref, maxsplit=1)[0]
     name, _, pick = ref.partition(":")
     if not name:
         raise CliError("пустое имя набора")
@@ -1399,12 +1405,14 @@ def cmd_info(ctx, a) -> int:
     return 0
 
 
-def cmd_fetch(ctx, a) -> int:
-    name, pick = parse_set_ref(a.set)
+def fetch_set(ctx, ref: str, out, quiet: bool = False) -> tuple[dict, dict]:
+    """Скачивает набор (или выбор позиций) как NNN.ext + meta.json → (meta, remote).
+    out — каталог или функция от полного имени набора."""
+    name, pick = parse_set_ref(ref)
     remote = ctx.get_set(name)
+    out = Path(out(remote["name"]) if callable(out) else out)
     stickers = remote["stickers"]
     positions = parse_positions(pick, len(stickers), "выбор") if pick else list(range(1, len(stickers) + 1))
-    out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     items = []
     for pos in positions:
@@ -1415,11 +1423,17 @@ def cmd_fetch(ctx, a) -> int:
         items.append({"pos": pos, "file": fn, "emoji": st.get("emoji"), "format": remote_format(st),
                       "custom_emoji_id": st.get("custom_emoji_id"), "file_unique_id": st["file_unique_id"],
                       "md5": hashlib.md5(data).hexdigest(), "needs_repainting": bool(st.get("needs_repainting"))})
-        print(f"  {fn}  {st.get('emoji', '')}  {human_size(len(data))}")
+        if not quiet:
+            print(f"  {fn}  {st.get('emoji', '')}  {human_size(len(data))}")
     meta = {"set": remote["name"], "title": remote["title"], "type": remote.get("sticker_type", "regular"),
             "needs_repainting": any(i["needs_repainting"] for i in items), "items": items}
     (out / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=1))
     print(f"скачано {len(items)} из {len(stickers)} в {out}")
+    return meta, remote
+
+
+def cmd_fetch(ctx, a) -> int:
+    fetch_set(ctx, a.set, Path(a.out))
     return 0
 
 
@@ -1596,12 +1610,38 @@ def pillow_frame_getter(im):
     return get
 
 
+TGS_HINT = "для превью TGS: pip install rlottie-python"
+
+
+def lottie_class():
+    try:
+        from rlottie_python import LottieAnimation
+    except ImportError:
+        return None
+    return LottieAnimation
+
+
+def tgs_frame_getter(anim):
+    total = max(1, int(anim.lottie_animation_get_totalframe()))
+
+    def get(frac: float):
+        im = anim.render_pillow_frame(frame_num=int((total - 1) * frac + 0.5)).convert("RGBA")
+        if im.width < 1 or im.height < 1:
+            raise CliError("пустая Lottie-анимация")
+        return im
+
+    return get
+
+
 def tile_picture(path: Path):
-    """RGBA-картинка для плитки; None для TGS (его не отрисовать без Lottie)."""
+    """RGBA-картинка для плитки; None для TGS, если нет rlottie-python."""
     Image, ImageOps = pil()
     ext = path.suffix.lower()
     if ext == ".tgs":
-        return None
+        lottie = lottie_class()
+        if lottie is None:
+            return None
+        return pick_frame(tgs_frame_getter(lottie.from_tgs(str(path))))
     if ext in STATIC_EXT | {".gif"}:
         with Image.open(path) as im:
             if getattr(im, "n_frames", 1) > 1:
@@ -1633,23 +1673,162 @@ def render_sheet(entries: list[tuple[int, Path]], cols: int, dark: bool = False)
         draw.rounded_rectangle((x + 4, y + 4, x + TILE_W - 5, y + TILE_H - 5), radius=14, fill=tile_bg,
                                outline=line)
         box_cx, box_cy = x + TILE_W // 2, y + 10 + TILE_IMG // 2
+        is_tgs = path.suffix.lower() == ".tgs"
+
+        def tgs_plaque():
+            draw.rectangle((x + 24, y + 34, x + TILE_W - 25, y + 34 + 132), outline=line, width=3)
+            centered("TGS", box_cx, box_cy, _font(44))
+
         try:
             pic = tile_picture(path)
         except MissingToolError:
             raise
         except Exception as e:  # noqa: BLE001
             warnings.append(f"{path.name}: не удалось построить превью ({redact(str(e))[:120]})")
-            centered("?", box_cx, box_cy, _font(80))
+            if is_tgs:
+                tgs_plaque()
+            else:
+                centered("?", box_cx, box_cy, _font(80))
         else:
             if pic is None:
-                draw.rectangle((x + 24, y + 34, x + TILE_W - 25, y + 34 + 132), outline=line, width=3)
-                centered("TGS", box_cx, box_cy, _font(44))
+                tgs_plaque()
+                if TGS_HINT not in warnings:
+                    warnings.append(TGS_HINT)
             else:
                 scale = min(TILE_IMG / pic.width, TILE_IMG / pic.height)
                 size = (max(1, round(pic.width * scale)), max(1, round(pic.height * scale)))
                 pic = pic.resize(size, Image.LANCZOS)
                 sheet.paste(pic, (box_cx - size[0] // 2, box_cy - size[1] // 2), pic)
         centered(str(number), x + TILE_W // 2, y + 10 + TILE_IMG + (TILE_H - TILE_IMG - 20) // 2, font)
+    return sheet, warnings
+
+
+STRIP_COLS = 2
+STRIP_CELL = 96
+STRIP_LABEL_W = 80
+STRIP_ROW_H = 104
+STRIP_GAP = 24
+STRIP_FONT = 40
+STRIP_PER_SHEET = 20
+
+
+def strip_row_w(frames: int) -> int:
+    return STRIP_LABEL_W + frames * STRIP_CELL + 8
+
+
+def strip_layout(count: int) -> tuple[int, int]:
+    cols = max(1, min(STRIP_COLS, count))
+    return cols, -(-count // cols)
+
+
+def strip_sheet_size(count: int, frames: int) -> tuple[int, int]:
+    cols, rows = strip_layout(count)
+    return (2 * SHEET_MARGIN + cols * strip_row_w(frames) + (cols - 1) * STRIP_GAP,
+            2 * SHEET_MARGIN + rows * STRIP_ROW_H)
+
+
+def strip_origin(i: int, count: int, frames: int) -> tuple[int, int]:
+    _, rows = strip_layout(count)
+    return (SHEET_MARGIN + (i // rows) * (strip_row_w(frames) + STRIP_GAP),
+            SHEET_MARGIN + (i % rows) * STRIP_ROW_H)
+
+
+def pillow_timed_getter(im):
+    """Кадр в долю длительности (по duration кадров), а не по номеру кадра."""
+    n = getattr(im, "n_frames", 1)
+    ends, total = [], 0
+    for k in range(n):
+        im.seek(k)
+        total += max(int(im.info.get("duration") or 100), 1)
+        ends.append(total)
+
+    def get(frac: float):
+        t = frac * total
+        k = next((i for i, e in enumerate(ends) if e > t), n - 1)
+        im.seek(k)
+        return im.convert("RGBA")
+
+    return get
+
+
+def strip_frames(path: Path, count: int):
+    """Кадры файла через равные доли длительности: список RGBA (один кадр у статики);
+    None — TGS без rlottie-python. Кадр, не получившийся у видео, — None в списке."""
+    Image, ImageOps = pil()
+    ext = path.suffix.lower()
+    fracs = [i / count for i in range(count)]
+    if ext == ".tgs":
+        lottie = lottie_class()
+        if lottie is None:
+            return None
+        anim = lottie.from_tgs(str(path))
+        total = max(1, int(anim.lottie_animation_get_totalframe()))
+
+        def get(frac: float):
+            im = anim.render_pillow_frame(frame_num=min(total - 1, int(total * frac))).convert("RGBA")
+            if im.width < 1 or im.height < 1:
+                raise CliError("пустая Lottie-анимация")
+            return im
+
+        return [get(f) for f in fracs]
+    if ext in STATIC_EXT | {".gif"}:
+        with Image.open(path) as im:
+            if getattr(im, "n_frames", 1) > 1:
+                get = pillow_timed_getter(im)
+                return [get(f).copy() for f in fracs]
+            return [ImageOps.exif_transpose(im).convert("RGBA").copy()]
+    with tempfile.TemporaryDirectory() as td:
+        get = video_frame_getter(path, Path(td))
+        return [get(f) for f in fracs]
+
+
+def render_strips(entries: list[tuple[int, Path]], frames: int, dark: bool = False):
+    """Лист строк: слева крупный номер, справа frames кадров анимации (статичная — один кадр).
+    Строки идут в две колонки сверху вниз. → (Image RGB, предупреждения)."""
+    Image, _ = pil()
+    from PIL import ImageDraw
+    bg, cell_bg, ink, line = ((23, 33, 43), (31, 44, 58), (240, 245, 250), (70, 86, 102)) if dark else \
+        ((255, 255, 255), (243, 245, 247), (17, 17, 17), (205, 211, 218))
+    sheet = Image.new("RGB", strip_sheet_size(len(entries), frames), bg)
+    draw = ImageDraw.Draw(sheet)
+    font = _font(STRIP_FONT)
+    warnings: list[str] = []
+
+    def centered(text, cx, cy, fnt):
+        l, t, r, b = draw.textbbox((0, 0), text, font=fnt)
+        draw.text((cx - (l + r) / 2, cy - (t + b) / 2), text, font=fnt, fill=ink)
+
+    for i, (number, path) in enumerate(entries):
+        x, y = strip_origin(i, len(entries), frames)
+        centered(str(number), x + STRIP_LABEL_W // 2 - 2, y + STRIP_ROW_H // 2, font)
+        try:
+            pics = strip_frames(path, frames)
+        except MissingToolError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            warnings.append(f"{path.name}: не удалось построить превью ({redact(str(e))[:120]})")
+            pics = []
+            plaque = "TGS" if path.suffix.lower() == ".tgs" else "?"
+        else:
+            plaque = "TGS"
+            if pics is None:
+                pics = []
+                warnings.append(TGS_HINT)
+        cells = len(pics) or 1
+        for k in range(cells):
+            cx = x + STRIP_LABEL_W + k * STRIP_CELL
+            draw.rounded_rectangle((cx + 2, y + 4, cx + STRIP_CELL - 3, y + STRIP_ROW_H - 5), radius=8,
+                                   fill=cell_bg, outline=line)
+            pic = pics[k] if pics else None
+            if pic is None:
+                if not pics:
+                    centered(plaque, cx + STRIP_CELL // 2, y + STRIP_ROW_H // 2, _font(24))
+                continue
+            inner = STRIP_CELL - 10
+            scale = min(inner / pic.width, inner / pic.height)
+            size = (max(1, round(pic.width * scale)), max(1, round(pic.height * scale)))
+            pic = pic.resize(size, Image.LANCZOS)
+            sheet.paste(pic, (cx + STRIP_CELL // 2 - size[0] // 2, y + STRIP_ROW_H // 2 - size[1] // 2), pic)
     return sheet, warnings
 
 
@@ -1672,19 +1851,26 @@ def collect_sheet_files(inputs: list[str]) -> list[Path]:
 
 
 def write_sheets(entries: list[tuple[int, Path]], out: Path, cols: int | None, dark: bool,
-                 per_sheet: int) -> list[Path]:
+                 per_sheet: int, frames: int | None = None) -> list[Path]:
     if out.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
         raise CliError("--out: файл .png или .jpg")
     if per_sheet < 1:
         raise CliError("--per-sheet: хотя бы 1")
+    if frames is not None and frames < 1:
+        raise CliError("--frames: хотя бы 1")
     out.parent.mkdir(parents=True, exist_ok=True)
-    written = []
+    written, shown = [], set()
     for page, start in enumerate(range(0, len(entries), per_sheet)):
         chunk = entries[start:start + per_sheet]
         target = out if page == 0 else out.with_name(f"{out.stem}_{page + 1}{out.suffix}")
-        sheet, warnings = render_sheet(chunk, max(1, min(cols or 5, len(chunk))), dark)
+        if frames:
+            sheet, warnings = render_strips(chunk, frames, dark)
+        else:
+            sheet, warnings = render_sheet(chunk, max(1, min(cols or 5, len(chunk))), dark)
         for w in warnings:
-            print(f"  ⚠ {w}", file=sys.stderr)
+            if w not in shown:
+                shown.add(w)
+                print(f"  ⚠ {w}", file=sys.stderr)
         sheet.save(target)
         written.append(target)
     return written
@@ -1693,11 +1879,111 @@ def write_sheets(entries: list[tuple[int, Path]], out: Path, cols: int | None, d
 def cmd_sheet(ctx, a) -> int:
     paths = collect_sheet_files(a.inputs)
     entries = list(enumerate(paths, 1))
-    written = write_sheets(entries, Path(a.out), a.cols, a.dark, a.per_sheet)
+    per_sheet = a.per_sheet or (STRIP_PER_SHEET if a.frames else 40)
+    written = write_sheets(entries, Path(a.out), a.cols, a.dark, per_sheet, a.frames)
     for n, p in entries:
         print(f"{n:>4}  {p.name}")
     print(f"\nлист: {', '.join(str(w) for w in written)}")
     print("отправьте эту картинку человеку: номера на ней — это номера файлов выше")
+    return 0
+
+
+def own_item_md5s(ctx, name: str, remote: dict) -> list[str | None]:
+    """md5 исходника каждого элемента своего пака (по порядку в Telegram): src_md5 из pack.json,
+    иначе текущий файл скачивается через getFile в files/ пака (cur_<unique_id>.ext) и считается;
+    повторный запуск берёт уже скачанное. pack.json при этом не пишется."""
+    state, _ = sync_state(load_state(ctx, name), remote)
+    files_dir = ctx.pack_dir(name) / "files"
+    out: list[str | None] = []
+    for it, st in zip(state["items"], remote["stickers"]):
+        if it.get("src_md5"):
+            out.append(it["src_md5"])
+            continue
+        uid = re.sub(r"[^A-Za-z0-9_-]", "_", st["file_unique_id"])
+        cached = next(iter(sorted(files_dir.glob(f"cur_{uid}.*"))), None) if files_dir.is_dir() else None
+        if cached is None:
+            data, ext = ctx.api.download(st["file_id"])
+            files_dir.mkdir(parents=True, exist_ok=True)
+            cached = files_dir / f"cur_{uid}{ext}"
+            cached.write_bytes(data)
+        out.append(md5_of(cached))
+    return out
+
+
+def load_compare_source(ctx, source: str, out: Path | None) -> tuple[dict, Path]:
+    """Каталог после fetch (с meta.json) или имя/ссылка пака (скачивается как fetch). → (meta, каталог)."""
+    d = Path(source)
+    if d.is_dir():
+        mp = d / "meta.json"
+        if not mp.is_file():
+            raise CliError(f"в {d} нет meta.json — сделайте fetch или укажите имя набора")
+        meta = json.loads(mp.read_text())
+        for it in meta["items"]:
+            if not it.get("md5"):
+                it["md5"] = md5_of(d / it["file"])
+        return meta, (out or d)
+    meta, _ = fetch_set(ctx, source, lambda n: out or ctx.base / "compare" / n, quiet=True)
+    return meta, out or ctx.base / "compare" / meta["set"]
+
+
+def compare_items(items: list[dict], own: list[str | None]) -> list[dict]:
+    mine: dict[str, int] = {}
+    for k, m in enumerate(own, 1):
+        if m:
+            mine.setdefault(m, k)
+    first: dict[str, int] = {}
+    out = []
+    for it in items:
+        m = it["md5"]
+        if m in mine:
+            status, dup = "own", mine[m]
+        elif m in first:
+            status, dup = "source", first[m]
+        else:
+            status, dup = "new", None
+            first[m] = it["pos"]
+        out.append({"pos": it["pos"], "file": it["file"], "emoji": it.get("emoji"), "format": it.get("format"),
+                    "md5": m, "status": status, "dup_of": dup})
+    return out
+
+
+def cmd_compare(ctx, a) -> int:
+    own_name_ref, _ = parse_set_ref(a.with_pack)
+    remote = ctx.get_set(own_name_ref)
+    own_name = remote["name"]
+    meta, out = load_compare_source(ctx, a.source, Path(a.out) if a.out else None)
+    src_dir = Path(a.source) if Path(a.source).is_dir() else out
+    own = own_item_md5s(ctx, own_name, remote)
+    rows = compare_items(meta["items"], own)
+    label = {"own": lambda r: f"повтор №{r['dup_of']}", "source": lambda r: f"повтор внутри источника №{r['dup_of']}",
+             "new": lambda r: "новое"}
+    for r in rows:
+        print(f"{r['pos']:>4}  {r.get('emoji') or '':<3} {r.get('format') or '':<8} {label[r['status']](r)}")
+    new = [r["pos"] for r in rows if r["status"] == "new"]
+    spec = compress_ranges(new)
+    n_own = sum(r["status"] == "own" for r in rows)
+    n_src = sum(r["status"] == "source" for r in rows)
+    print(f"\nновых {len(new)} из {len(rows)}: {spec or '—'}  "
+          f"(повторов своего {n_own}, внутри источника {n_src}; сравнение с {own_name}, {len(own)} шт.)")
+    if new:
+        print(f"добавить: add ПАК --from-set {meta['set']}:{spec}")
+    out.mkdir(parents=True, exist_ok=True)
+    report = {"source": meta["set"], "with": own_name, "total": len(rows), "new_count": len(new),
+              "new": new, "new_spec": spec, "items": rows}
+    (out / "compare.json").write_text(json.dumps(report, ensure_ascii=False, indent=1))
+    print(f"отчёт: {out / 'compare.json'}")
+    if a.sheet:
+        if not new:
+            print("новых нет — картинки не делаю")
+            return 0
+        by_pos = {r["pos"]: src_dir / r["file"] for r in rows}
+        entries = [(pos, by_pos[pos]) for pos in new]
+        written = write_sheets(entries, out / "sheet-new.png", None, False, 40)
+        animated = [(pos, p) for pos, p in entries
+                    if next(r for r in rows if r["pos"] == pos)["format"] != "static"]
+        if animated:
+            written += write_sheets(animated, out / "frames-new.png", None, False, STRIP_PER_SHEET, 6)
+        print("картинки (номера = номера в источнике): " + ", ".join(str(w) for w in written))
     return 0
 
 
@@ -1714,12 +2000,38 @@ button{{font:inherit;padding:8px 14px;border-radius:8px;border:1px solid #8886;b
 figure{{margin:0;text-align:center}}
 video,img{{width:{size}px;height:{size}px;object-fit:contain}}
 .tgs{{width:{size}px;height:{size}px;display:flex;align-items:center;justify-content:center;margin:auto;border:1px dashed #8888;border-radius:8px;font-size:12px}}
+.tgs.ok{{border:0}}
 figcaption{{font-size:20px;font-weight:700}}
 </style></head><body>
 <h1>{title}</h1><p>{count} шт. · порядок как в наборе, номера с 1</p>
 <button onclick="document.body.classList.toggle('dark')">Светлый / тёмный фон</button>
-<div class="g">{cells}</div></body></html>
+<div class="g">{cells}</div>{scripts}</body></html>
 """
+
+LOTTIE_URL = "https://cdn.jsdelivr.net/npm/lottie-web@5.13.0/build/player/lottie.min.js"
+LOTTIE_SRI = "sha384-vfy4Ln1gWZnGF5PKMEkqQ+kS3n2GAauccVbfcEDS59jQl6EbNsVVCHzSP0OtTpRC"
+TGS_SCRIPTS = (
+    f'<script src="{LOTTIE_URL}" integrity="{LOTTIE_SRI}" crossorigin="anonymous"></script>\n'
+    """<script>
+(function(){
+if(!window.lottie||typeof DecompressionStream==='undefined'||!window.fetch)return;
+document.querySelectorAll('.tgs[data-tgs]').forEach(function(cell){
+fetch(cell.dataset.tgs).then(function(r){
+if(!r.ok)throw new Error(r.status);
+return new Response(r.body.pipeThrough(new DecompressionStream('gzip'))).text();
+}).then(function(t){
+var box=document.createElement('div');
+box.style.cssText='width:100%;height:100%';
+cell.appendChild(box);
+try{lottie.loadAnimation({container:box,renderer:'svg',loop:true,autoplay:true,animationData:JSON.parse(t)});}
+catch(e){box.remove();throw e;}
+cell.classList.add('ok');
+cell.firstChild.style.display='none';
+}).catch(function(){});
+});
+})();
+</script>
+""")
 
 
 def claim_preview_dir(d: Path, adopt: bool = False) -> None:
@@ -1768,14 +2080,15 @@ def write_preview(out: Path, files: list[Path], title: str, kind: str,
         if fn.endswith(".webm"):
             tag = f'<video src="{fn}" autoplay loop muted playsinline></video>'
         elif fn.endswith(".tgs"):
-            tag = '<div class="tgs">TGS</div>'
+            tag = f'<div class="tgs" data-tgs="{fn}"><span>TGS</span></div>'
         else:
             tag = f'<img src="{fn}" alt="">'
         cells.append(f"<figure>{tag}<figcaption>{n}</figcaption></figure>")
     size = 64 if kind == "emoji" else 128
     index = writable_target(out / "index.html")
     index.write_text(PAGE.format(title=html.escape(title), count=len(cells), cells="".join(cells),
-                                 size=size, cell=size + 16))
+                                 size=size, cell=size + 16,
+                                 scripts=TGS_SCRIPTS if any(f.suffix == ".tgs" for f in copied) else ""))
     sheets = write_sheets(list(enumerate(copied, 1)), out / "sheet.png", None, False, 40)
     for f in [index, *copied, *sheets]:
         f.chmod(0o644)
@@ -1915,6 +2228,17 @@ def build_parser() -> argparse.ArgumentParser:
              "Пример: fetch AIByVolodya --out /tmp/pack   или   fetch AIByVolodya:1,5-9 --out /tmp/pack")
     sp.add_argument("set", help="имя набора, можно с выбором позиций: имя:1,3,5-9")
     sp.add_argument("--out", required=True, help="каталог для файлов")
+    sp = add("compare", "сравнить чужой пак со своим: повторы побайтно, новые номера, картинки", cmd_compare,
+             "Источник — имя/ссылка пака (скачивается как fetch) или каталог после fetch. Для каждого элемента:\n"
+             "«повтор №K» (файл совпал побайтно с исходником K-го элемента своего пака), «повтор внутри источника №M»\n"
+             "или «новое». Похожие, но не побайтные анимации скрипт не угадывает: смотрите полоски (--sheet).\n"
+             "Итог «новых N из M: 3,5-9» подходит для add ПАК --from-set ИСТОЧНИК:3,5-9. Записывает compare.json.")
+    sp.add_argument("source", help="имя/ссылка чужого пака (можно имя:выбор) или каталог после fetch")
+    sp.add_argument("--with", dest="with_pack", required=True, metavar="ПАК", help="свой пак (короткое имя, имя или ссылка)")
+    sp.add_argument("--out", metavar="КАТАЛОГ", help="куда скачать источник и писать compare.json "
+                                                     "(по умолчанию <каталог>/compare/<имя>)")
+    sp.add_argument("--sheet", action="store_true",
+                    help="картинки только по новым: sheet-new.png и полоски frames-new.png (по 6 кадров)")
     sp = add("prepare", "привести файлы к требованиям Telegram (WEBP/WEBM)", cmd_prepare,
              "emoji — ровно 100×100; sticker — одна сторона 512. Статичные картинки сначала обрезаются по альфе\n"
              "(alpha ≤ 8 — прозрачно), затем вписываются с отступом --pad; --no-trim отключает обрезку. Анимация → WEBM VP9 без звука, ≤3 с, ≤30 к/с, ≤256 КБ.\n"
@@ -1976,13 +2300,17 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--keywords", help="ключевые слова через запятую")
     sp = add("sheet", "контактный лист с крупными номерами по файлам/каталогам (PNG для чата)", cmd_sheet,
              "Для видео берётся первый непустой кадр (если первый почти прозрачный — из середины),\n"
-             "для TGS — плашка «TGS». Нужен, чтобы показать человеку кандидатов до сборки пака.\n"
+             "для TGS — кадр через rlottie-python или плашка «TGS». Со --frames N — полоска из N кадров на анимацию. Нужен, чтобы показать человеку кандидатов до сборки пака.\n"
              "Много файлов делятся на листы (--per-sheet): sheet.png, sheet_2.png… с общей нумерацией.")
     sp.add_argument("inputs", nargs="+", metavar="файл_или_каталог")
     sp.add_argument("--out", required=True, metavar="ФАЙЛ", help="куда сохранить, например sheet.png")
     sp.add_argument("--cols", type=int, help="колонок в сетке (по умолчанию 5)")
     sp.add_argument("--dark", action="store_true", help="тёмный фон")
-    sp.add_argument("--per-sheet", type=int, default=40, metavar="N", help="плиток на лист (по умолчанию 40)")
+    sp.add_argument("--per-sheet", type=int, default=None, metavar="N",
+                    help="плиток на лист (по умолчанию 40; со --frames — строк, по умолчанию 20)")
+    sp.add_argument("--frames", type=int, metavar="N",
+                    help="полоски: каждая анимация строкой из N кадров через равные доли длительности, слева "
+                         "номер; статичные — один кадр; строки в две колонки (--cols не действует)")
     sp = add("preview", "превью пака по текущему порядку: sheet.png с номерами и index.html", cmd_preview,
              "Файлы кладутся как 01.ext, 02.ext… рядом с sheet.png и index.html (светлый/тёмный фон,\n"
              "мобильная вёрстка). Старые файлы вида NN.ext и sheet*.png в каталоге заменяются.\n"

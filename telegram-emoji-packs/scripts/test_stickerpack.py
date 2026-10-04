@@ -75,6 +75,23 @@ def test_parse_set_ref():
     assert sp.parse_set_ref("https://t.me/addemoji/AIByVolodya") == ("AIByVolodya", None)
 
 
+@pytest.mark.parametrize("ref,expected", [
+    ("https://t.me/addstickers/Pack_1", ("Pack_1", None)),
+    ("http://t.me/addemoji/Pack_1/", ("Pack_1", None)),
+    ("t.me/addemoji/Pack_1?start=1", ("Pack_1", None)),
+    ("https://telegram.me/addemoji/Pack_1#x", ("Pack_1", None)),
+    ("  https://t.me/addemoji/Pack_1:1,3-5 ", ("Pack_1", "1,3-5")),
+    ("Pack_1", ("Pack_1", None)),
+])
+def test_parse_set_ref_urls(ref, expected):
+    assert sp.parse_set_ref(ref) == expected
+
+
+def test_parse_set_ref_empty_name():
+    with pytest.raises(sp.CliError):
+        sp.parse_set_ref("https://t.me/addemoji/")
+
+
 def test_compress_ranges():
     assert sp.compress_ranges([1, 2, 3, 5, 7, 8]) == "1-3,5,7-8"
 
@@ -1378,20 +1395,108 @@ def test_sheet_video_with_content_uses_first_frame(tmp_path):
     assert frame.getpixel((50, 50))[0] > 200
 
 
-def test_sheet_tgs_placeholder_and_animated_gif(tmp_path):
-    import gzip
+def block_rlottie(monkeypatch):
+    import builtins
+    real = builtins.__import__
+
+    def fake(name, *a, **k):
+        if name == "rlottie_python" or name.startswith("rlottie_python."):
+            raise ImportError("no rlottie")
+        return real(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", fake)
+
+
+def make_tgs(path, color=(1, 0, 0, 1)):
+    layer = {"ty": 4, "ip": 0, "op": 30, "st": 0,
+             "ks": {"o": {"a": 0, "k": 100}, "r": {"a": 0, "k": 0}, "p": {"a": 0, "k": [50, 50, 0]},
+                    "a": {"a": 0, "k": [0, 0, 0]}, "s": {"a": 0, "k": [100, 100, 100]}},
+             "shapes": [{"ty": "gr", "it": [
+                 {"ty": "rc", "p": {"a": 0, "k": [0, 0]}, "s": {"a": 0, "k": [80, 80]}, "r": {"a": 0, "k": 0}},
+                 {"ty": "fl", "c": {"a": 0, "k": list(color)}, "o": {"a": 0, "k": 100}},
+                 {"ty": "tr", "p": {"a": 0, "k": [0, 0]}, "a": {"a": 0, "k": [0, 0]},
+                  "s": {"a": 0, "k": [100, 100]}, "r": {"a": 0, "k": 0}, "o": {"a": 0, "k": 100}}]}]}
+    doc = {"v": "5.5.2", "fr": 30, "ip": 0, "op": 30, "w": 100, "h": 100, "layers": [layer]}
+    path.write_bytes(gzip.compress(json.dumps(doc).encode()))
+    return path
+
+
+def sheet_gif(tmp_path):
     from PIL import Image
-    tgs = tmp_path / "a.tgs"
-    tgs.write_bytes(gzip.compress(b"{}"))
-    assert sp.tile_picture(tgs) is None
     gif = tmp_path / "g.gif"
     first = Image.new("RGBA", (40, 40), (0, 0, 0, 0))
     second = Image.new("RGBA", (40, 40), (0, 200, 0, 255))
     first.save(gif, save_all=True, append_images=[second, second], duration=100, loop=0, disposal=2)
-    pic = sp.tile_picture(gif)  # ffmpeg не нужен
-    assert sp.content_pixels(pic) > 0
+    return gif
+
+
+def test_sheet_tgs_placeholder_and_hint_without_rlottie(tmp_path, monkeypatch, capsys):
+    block_rlottie(monkeypatch)
+    tgs = tmp_path / "a.tgs"
+    tgs.write_bytes(gzip.compress(b"{}"))
+    other = tmp_path / "b.tgs"
+    other.write_bytes(gzip.compress(b"{}"))
+    assert sp.tile_picture(tgs) is None
+    gif = sheet_gif(tmp_path)
+    assert sp.content_pixels(sp.tile_picture(gif)) > 0  # ffmpeg не нужен
     out = tmp_path / "s.png"
-    assert sp.main(["sheet", str(tgs), str(gif), "--out", str(out)]) == 0
+    capsys.readouterr()
+    assert sp.main(["sheet", str(tgs), str(other), str(gif), "--out", str(out)]) == 0
+    err = capsys.readouterr().err
+    assert err.count("pip install rlottie-python") == 1 and "для превью TGS" in err
+    assert out.is_file()
+
+
+def test_sheet_tgs_real_frame_with_rlottie(tmp_path, capsys):
+    pytest.importorskip("rlottie_python")
+    from PIL import Image
+    tgs = make_tgs(tmp_path / "a.tgs")
+    pic = sp.tile_picture(tgs)
+    assert pic.getpixel((50, 50)) == (255, 0, 0, 255) and pic.getpixel((2, 2))[3] == 0
+    out = tmp_path / "s.png"
+    capsys.readouterr()
+    assert sp.main(["sheet", str(tgs), "--out", str(out)]) == 0
+    assert "rlottie" not in capsys.readouterr().err
+    with Image.open(out) as im:
+        x, y = sp.tile_origin(0, 1)
+        r, g, b = im.convert("RGB").getpixel((x + sp.TILE_W // 2, y + 10 + sp.TILE_IMG // 2))
+        assert r > 200 and g < 60 and b < 60
+
+
+def test_sheet_tgs_render_error_gives_plaque_and_warning(tmp_path, capsys):
+    pytest.importorskip("rlottie_python")
+    from PIL import Image
+    bad = tmp_path / "bad.tgs"
+    bad.write_bytes(b"not a tgs")
+    out = tmp_path / "s.png"
+    capsys.readouterr()
+    assert sp.main(["sheet", str(bad), "--out", str(out)]) == 0
+    err = capsys.readouterr().err
+    assert "bad.tgs" in err and "не удалось построить превью" in err
+    with Image.open(out) as im:
+        assert im.size == sp.sheet_size(1, 1)
+
+
+def test_preview_index_loads_tgs_with_integrity_and_keeps_fallback(tmp_path):
+    files = []
+    for n, name in enumerate(["a.png", "b.tgs"]):
+        f = tmp_path / name
+        if name.endswith(".tgs"):
+            f.write_bytes(gzip.compress(b"{}"))
+        else:
+            from PIL import Image
+            Image.new("RGBA", (64, 64), (255, 0, 0, 255)).save(f)
+        files.append(f)
+    index, copied, _ = sp.write_preview(tmp_path / "pv", files, "T", "emoji")
+    page = index.read_text()
+    assert 'data-tgs="02.tgs"' in page and "<span>TGS</span>" in page
+    assert 'lottie-web@5.13.0/build/player/lottie.min.js' in page
+    assert 'integrity="sha384-vfy4Ln1gWZnGF5PKMEkqQ+kS3n2GAauccVbfcEDS59jQl6EbNsVVCHzSP0OtTpRC"' in page
+    assert "DecompressionStream('gzip')" in page and "renderer:'svg'" in page
+    assert page.count("<script") == 2
+    # без TGS страница не тянет внешних скриптов
+    index2, _, _ = sp.write_preview(tmp_path / "pv2", [files[0]], "T", "emoji")
+    assert "<script" not in index2.read_text() and "jsdelivr" not in index2.read_text()
 
 
 # ------------------------------------------------------- без ffmpeg и Pillow
@@ -1440,3 +1545,244 @@ def test_missing_pillow_message(monkeypatch, tmp_path, capsys):
     p.write_bytes(b"x")
     assert sp.main(["validate", str(p), "--kind", "emoji"]) == 1
     assert "pip install pillow" in capsys.readouterr().err
+
+
+# ------------------------------------------------------------- compare и полоски
+
+class CmpApi(FakeApi):
+    """FakeApi с настоящими байтами файлов: blobs[file_id] → (байты, расширение)."""
+    def __init__(self):
+        super().__init__()
+        self.blobs = {}
+        self.downloads = []
+
+    def download(self, file_id):
+        self.downloads.append(file_id)
+        data, ext = self.blobs[file_id]
+        return data, ext
+
+    def add_set(self, name, blobs, fmt="static", kind="custom_emoji"):
+        stickers = []
+        for i, (data, emoji) in enumerate(blobs, 1):
+            fid = f"{name}-f{i}"
+            self.blobs[fid] = (data, ".webp")
+            stickers.append({"file_id": fid, "file_unique_id": f"{name}-u{i}", "custom_emoji_id": f"{name}-c{i}",
+                             "emoji": emoji, "is_video": fmt == "video", "is_animated": fmt == "animated"})
+        self.sets[name] = {"title": name, "type": kind, "stickers": stickers}
+
+
+def webp_bytes(color):
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGBA", (100, 100), color).save(buf, "WEBP", lossless=True)
+    return buf.getvalue()
+
+
+def table_rows(text):
+    return [l for l in text.splitlines() if l[:4].strip().isdigit()]
+
+
+def cmp_setup(work):
+    """Свой пак demo — файлы 1..4 (src_md5 известен); источник «чужой»: 6 элементов."""
+    tmp, files = work
+    api = CmpApi()
+    assert run(tmp, api, "create", "demo", "--title", "T", "--kind", "emoji", "--emoji", "😀",
+               "--files", *map(str, files[:4])) == 0
+    own = [f.read_bytes() for f in files[:4]]
+    a, b = webp_bytes((1, 200, 1, 255)), webp_bytes((1, 1, 200, 255))
+    # 1: свой №2, 2: новое, 3: повтор №2 внутри источника, 4: свой №4, 5: новое, 6: повтор 5
+    api.add_set("other", [(own[1], "🅰"), (a, "🅱"), (a, "🅲"), (own[3], "🅳"), (b, "🅴"), (b, "🅵")])
+    return tmp, files, api, a, b
+
+
+def test_compare_statuses_summary_and_json(work, capsys):
+    tmp, files, api, a, b = cmp_setup(work)
+    out = tmp / "cmp"
+    capsys.readouterr()
+    before = len(api.log)
+    assert run(tmp, api, "compare", "other", "--with", "demo", "--out", str(out)) == 0
+    assert set(api.log[before:]) <= {"getMe", "getStickerSet"}  # Telegram только читается
+    text = capsys.readouterr().out
+    lines = table_rows(text)
+    assert len(lines) == 6
+    assert "повтор №2" in lines[0] and "повтор №4" in lines[3]
+    assert "новое" in lines[1] and "новое" in lines[4]
+    assert "повтор внутри источника №2" in lines[2] and "повтор внутри источника №5" in lines[5]
+    assert "новых 2 из 6: 2,5" in text
+    assert "add ПАК --from-set other:2,5" in text
+    rep = json.loads((out / "compare.json").read_text())
+    assert rep["new"] == [2, 5] and rep["new_spec"] == "2,5" and rep["source"] == "other" and rep["with"] == "demo_by_testbot"
+    assert [r["status"] for r in rep["items"]] == ["own", "new", "source", "own", "new", "source"]
+    assert [r["dup_of"] for r in rep["items"]] == [2, None, 2, 4, None, 5]
+    assert (out / "001.webp").is_file() and (out / "meta.json").is_file()
+    # свой пак с известными src_md5 не скачивался, Telegram ничего не менял
+    assert not any(f.startswith("demo_by_testbot") for f in api.downloads)
+
+
+def test_compare_new_ranges_feed_add_from_set(work, capsys):
+    tmp, files, api, a, b = cmp_setup(work)
+    capsys.readouterr()
+    assert run(tmp, api, "compare", "other", "--with", "demo", "--out", str(tmp / "c")) == 0
+    spec = next(l for l in capsys.readouterr().out.splitlines() if "--from-set" in l).split("--from-set ")[1]
+    assert spec == "other:2,5"
+    assert run(tmp, api, "add", "demo", "--from-set", spec) == 0
+    assert len(api.sets["demo_by_testbot"]["stickers"]) == 6
+
+
+def test_compare_own_item_without_src_is_downloaded_once(work, capsys):
+    tmp, files, api, a, b = cmp_setup(work)
+    c = webp_bytes((9, 9, 9, 255))
+    # элемент добавлен в свой пак вне скрипта: в pack.json его нет → src_md5 неизвестен
+    sticker = {"file_id": "outside-f", "file_unique_id": "outside-u", "custom_emoji_id": "outside-c",
+               "emoji": "🙂", "is_video": False, "is_animated": False}
+    api.blobs["outside-f"] = (c, ".webp")
+    api.sets["demo_by_testbot"]["stickers"].append(sticker)
+    api.add_set("third", [(c, "🅰"), (a, "🅱")])
+    capsys.readouterr()
+    assert run(tmp, api, "compare", "third", "--with", "demo", "--out", str(tmp / "c3")) == 0
+    text = capsys.readouterr().out
+    rows = table_rows(text)
+    assert "повтор №5" in rows[0] and "новое" in rows[1] and "новых 1 из 2: 2" in text
+    assert api.downloads.count("outside-f") == 1
+    assert (tmp / "state" / "demo_by_testbot" / "files" / "cur_outside-u.webp").read_bytes() == c
+    assert not (tmp / "state" / "demo_by_testbot" / "pack.json").read_text().count("outside")  # pack.json не тронут
+    api.downloads.clear()
+    assert run(tmp, api, "compare", "third", "--with", "demo", "--out", str(tmp / "c3")) == 0
+    assert "outside-f" not in api.downloads  # второй запуск берёт скачанное
+
+
+def test_compare_accepts_urls_and_fetched_directory(work, capsys):
+    tmp, files, api, a, b = cmp_setup(work)
+    out = tmp / "u"
+    assert run(tmp, api, "compare", "https://t.me/addemoji/other", "--with",
+               "https://t.me/addemoji/demo_by_testbot", "--out", str(out)) == 0
+    assert json.loads((out / "compare.json").read_text())["new_spec"] == "2,5"
+    fetched = tmp / "fetched"
+    assert run(tmp, api, "fetch", "https://t.me/addemoji/other:2-6", "--out", str(fetched)) == 0
+    assert run(tmp, api, "info", "https://t.me/addemoji/other") == 0
+    capsys.readouterr()
+    assert run(tmp, api, "compare", str(fetched), "--with", "demo") == 0
+    text = capsys.readouterr().out
+    assert "новых 2 из 5: 2,5" in text and "add ПАК --from-set other:2,5" in text
+    rep = json.loads((fetched / "compare.json").read_text())  # без --out отчёт рядом с каталогом-источником
+    assert rep["items"][0]["pos"] == 2 and rep["items"][0]["status"] == "new"
+
+
+def test_compare_default_out_in_home(work):
+    tmp, files, api, a, b = cmp_setup(work)
+    assert run(tmp, api, "compare", "other", "--with", "demo") == 0
+    assert (tmp / "state" / "compare" / "other" / "compare.json").is_file()
+
+
+def test_compare_sheet_only_new(work, capsys):
+    from PIL import Image
+    tmp, files, api, a, b = cmp_setup(work)
+    out = tmp / "cs"
+    capsys.readouterr()
+    assert run(tmp, api, "compare", "other", "--with", "demo", "--out", str(out), "--sheet") == 0
+    with Image.open(out / "sheet-new.png") as im:
+        assert im.size == sp.sheet_size(2, 2)  # только 2 и 5
+        x, y = sp.tile_origin(0, 2)
+        assert im.convert("RGB").getpixel((x + sp.TILE_W // 2, y + 10 + sp.TILE_IMG // 2))[1] > 150  # зелёный (2)
+        x, y = sp.tile_origin(1, 2)
+        assert im.convert("RGB").getpixel((x + sp.TILE_W // 2, y + 10 + sp.TILE_IMG // 2))[2] > 150  # синий (5)
+    assert not (out / "frames-new.png").exists()  # новых анимаций нет
+
+
+def test_compare_sheet_frames_for_new_animations(work, tmp_path, capsys):
+    from PIL import Image
+    tmp, files = work
+    api = CmpApi()
+    gif = tmp / "g.gif"
+    frames = [Image.new("RGBA", (40, 40), c) for c in ((255, 0, 0, 255), (0, 255, 0, 255), (0, 0, 255, 255))]
+    frames[0].save(gif, save_all=True, append_images=frames[1:], duration=100, loop=0)
+    api.add_set("anim", [(gif.read_bytes(), "🅰")], fmt="video")
+    api.blobs["anim-f1"] = (gif.read_bytes(), ".gif")
+    api.add_set("mine", [(webp_bytes((5, 5, 5, 255)), "😀")])
+    out = tmp / "ca"
+    assert run(tmp, api, "compare", "anim", "--with", "mine", "--out", str(out), "--sheet") == 0
+    with Image.open(out / "frames-new.png") as im:
+        assert im.size == sp.strip_sheet_size(1, 6)
+
+
+def make_color_gif(path, colors, duration=100):
+    from PIL import Image
+    ims = [Image.new("RGBA", (40, 40), c) for c in colors]
+    ims[0].save(path, save_all=True, append_images=ims[1:], duration=duration, loop=0)
+    return path
+
+
+def test_sheet_frames_strips_sizes_and_frames(tmp_path, capsys):
+    from PIL import Image
+    gif = make_color_gif(tmp_path / "a.gif", [(255, 0, 0, 255), (0, 255, 0, 255), (0, 0, 255, 255),
+                                              (255, 255, 0, 255)])
+    d, pngs = make_pngs(tmp_path, 2)
+    out = tmp_path / "strips.png"
+    assert sp.main(["sheet", str(gif), *map(str, pngs), "--out", str(out), "--frames", "4"]) == 0
+    assert "лист:" in capsys.readouterr().out
+    with Image.open(out) as im:
+        assert im.size == sp.strip_sheet_size(3, 4)
+        rgb = im.convert("RGB")
+        # три строки в две колонки сверху вниз: 1 и 2 слева, 3 справа
+        x0, y0 = sp.strip_origin(0, 3, 4)
+        assert sp.strip_origin(1, 3, 4)[0] == x0 and sp.strip_origin(2, 3, 4)[0] > x0
+        centers = [rgb.getpixel((x0 + sp.STRIP_LABEL_W + k * sp.STRIP_CELL + sp.STRIP_CELL // 2,
+                                 y0 + sp.STRIP_ROW_H // 2)) for k in range(4)]
+        assert centers[0][0] > 200 and centers[0][1] < 60            # красный
+        assert centers[1][1] > 200 and centers[1][0] < 60            # зелёный
+        assert centers[2][2] > 200 and centers[2][0] < 60            # синий
+        assert centers[3][0] > 200 and centers[3][1] > 200           # жёлтый
+        label = rgb.crop((x0 + 6, y0 + 6, x0 + sp.STRIP_LABEL_W - 6, y0 + sp.STRIP_ROW_H - 6))
+        assert min(label.convert("L").tobytes()) < 80                # крупный номер слева
+        # статичная (строка 2) — один кадр, остальные ячейки строки не нарисованы
+        x1, y1 = sp.strip_origin(1, 3, 4)
+        first = rgb.getpixel((x1 + sp.STRIP_LABEL_W + sp.STRIP_CELL // 2, y1 + sp.STRIP_ROW_H // 2))
+        second = rgb.getpixel((x1 + sp.STRIP_LABEL_W + sp.STRIP_CELL + sp.STRIP_CELL // 2, y1 + sp.STRIP_ROW_H // 2))
+        assert first[0] > 150 and second == (255, 255, 255)
+
+
+def test_sheet_frames_equal_fractions_of_duration(tmp_path):
+    # кадры разной длительности: красный 300 мс, синий 100 мс → при N=4 три красных и один синий
+    from PIL import Image
+    gif = tmp_path / "t.gif"
+    red, blue = Image.new("RGBA", (40, 40), (255, 0, 0, 255)), Image.new("RGBA", (40, 40), (0, 0, 255, 255))
+    red.save(gif, save_all=True, append_images=[blue], duration=[300, 100], loop=0)
+    out = tmp_path / "s.png"
+    assert sp.main(["sheet", str(gif), "--out", str(out), "--frames", "4"]) == 0
+    with Image.open(out) as im:
+        rgb = im.convert("RGB")
+        x0, y0 = sp.strip_origin(0, 1, 4)
+        px = [rgb.getpixel((x0 + sp.STRIP_LABEL_W + k * sp.STRIP_CELL + sp.STRIP_CELL // 2, y0 + sp.STRIP_ROW_H // 2))
+              for k in range(4)]
+    assert [p[0] > 200 for p in px] == [True, True, True, False] and px[3][2] > 200
+
+
+def test_sheet_frames_splits_pages_and_video(tmp_path, capsys):
+    from PIL import Image
+    webm = tmp_path / "v.webm"
+    make_alpha_webm(webm, empty_frames=5, total=10)
+    d, pngs = make_pngs(tmp_path, 3, size=(20, 20))
+    out = tmp_path / "p" / "s.png"
+    assert sp.main(["sheet", str(webm), *map(str, pngs), "--out", str(out), "--frames", "3", "--per-sheet", "2"]) == 0
+    assert out.is_file() and (tmp_path / "p" / "s_2.png").is_file()
+    with Image.open(out) as im:
+        assert im.size == sp.strip_sheet_size(2, 3)
+        rgb = im.convert("RGB")
+        x0, y0 = sp.strip_origin(0, 2, 3)
+        mid = lambda k: rgb.getpixel((x0 + sp.STRIP_LABEL_W + k * sp.STRIP_CELL + sp.STRIP_CELL // 2,  # noqa: E731
+                                     y0 + sp.STRIP_ROW_H // 2))
+        assert mid(0) == (243, 245, 247)  # начало прозрачное: пустая ячейка
+        assert mid(2)[0] > 200 and mid(2)[1] < 60  # к концу — красный квадрат
+    assert sp.main(["sheet", str(webm), "--out", str(tmp_path / "x.png"), "--frames", "0"]) == 1
+
+
+def test_sheet_frames_tgs(tmp_path, monkeypatch, capsys):
+    from PIL import Image
+    tgs = make_tgs(tmp_path / "a.tgs")
+    out = tmp_path / "t.png"
+    block_rlottie(monkeypatch)
+    capsys.readouterr()
+    assert sp.main(["sheet", str(tgs), "--out", str(out), "--frames", "5"]) == 0
+    assert capsys.readouterr().err.count("pip install rlottie-python") == 1
+    with Image.open(out) as im:
+        assert im.size == sp.strip_sheet_size(1, 5)
