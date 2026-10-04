@@ -110,12 +110,16 @@ def pil():
     return Image, ImageOps
 
 
+def env_get(env, name: str) -> str | None:
+    """Значение переменной: из отображения env (в тестах) или из окружения процесса."""
+    return os.environ.get(name) if env is None else env.get(name)
+
+
 def home_dir(env=None) -> Path:
-    env = os.environ if env is None else env
-    if env.get("STICKERPACKS_HOME"):
-        return Path(env["STICKERPACKS_HOME"]).expanduser()
-    if env.get("HERMES_HOME"):
-        return Path(env["HERMES_HOME"]).expanduser() / "sticker-packs"
+    if env_get(env, "STICKERPACKS_HOME"):
+        return Path(env_get(env, "STICKERPACKS_HOME")).expanduser()
+    if env_get(env, "HERMES_HOME"):
+        return Path(env_get(env, "HERMES_HOME")).expanduser() / "sticker-packs"
     return Path.home() / ".sticker-packs"
 
 
@@ -147,7 +151,8 @@ NO_TOKEN_HELP = (
     "  1. Откройте @BotFather → /newbot, придумайте имя и username (на «bot»).\n"
     "  2. Откройте нового бота в Telegram и нажмите «Старт» (иначе он не сможет писать вам).\n"
     "  3. Положите токен в переменную STICKER_BOT_TOKEN: в Korra — «Настройки → Ключи и доступы → "
-    "Пользовательские ключи», в Hermes — ~/.hermes/.env, в обычной оболочке — export STICKER_BOT_TOKEN=…\n"
+    "Пользовательские ключи», в Hermes — файл .env в каталоге Hermes ($HERMES_HOME, обычно ~/.hermes), "
+    "в обычной оболочке — export STICKER_BOT_TOKEN=…\n"
     "     Либо укажите файл: --token-file ПУТЬ [--token-var ИМЯ] или `setup --token-env-file ПУТЬ`.\n"
     "  4. Запустите `stickerpack.py setup`.\n"
     "Не присылайте токен в чат: он даёт полный доступ к боту.")
@@ -172,13 +177,13 @@ def read_token_file(path: Path, var: str | None = None) -> tuple[str, str | None
 def resolve_token(token_file: str | None = None, token_var: str | None = None,
                   config: dict | None = None, env=None) -> str:
     """Порядок: --token-file → STICKER_BOT_TOKEN → config.json (token_env_file + token_var)."""
-    env = os.environ if env is None else env
     config = config or {}
     token = None
+    env_token = (env_get(env, "STICKER_BOT_TOKEN") or "").strip()
     if token_file:
         token, _ = read_token_file(Path(token_file).expanduser(), token_var)
-    elif env.get("STICKER_BOT_TOKEN", "").strip():
-        token = env["STICKER_BOT_TOKEN"].strip()
+    elif env_token:
+        token = env_token
     elif config.get("token_env_file"):
         token, _ = read_token_file(Path(config["token_env_file"]).expanduser(),
                                    token_var or config.get("token_var"))
@@ -190,10 +195,9 @@ def resolve_token(token_file: str | None = None, token_var: str | None = None,
 
 def resolve_owner(flag: int | None, config: dict | None = None, env=None) -> tuple[int | None, str]:
     """Порядок: --owner → STICKER_OWNER_ID → config.json (owner_id). (None, '') если не задан."""
-    env = os.environ if env is None else env
     if flag is not None:
         return flag, "флаг --owner"
-    raw = env.get("STICKER_OWNER_ID", "").strip()
+    raw = (env_get(env, "STICKER_OWNER_ID") or "").strip()
     if raw:
         try:
             return int(raw), "STICKER_OWNER_ID"

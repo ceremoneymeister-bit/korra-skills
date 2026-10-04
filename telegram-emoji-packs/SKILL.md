@@ -57,7 +57,7 @@ $SP preview <пак>                           # sheet.png и index.html по т
    Hermes токен бота агента намеренно скрыт от команд.
 2. Токен кладётся в переменную `STICKER_BOT_TOKEN` — **не в чат**:
    Korra — «Настройки → Ключи и доступы → Пользовательские ключи»;
-   Hermes — `~/.hermes/.env`; Claude Code, Codex, Cursor, OpenClaw —
+   Hermes — файл `.env` в каталоге Hermes (`$HERMES_HOME`); Claude Code, Codex, Cursor, OpenClaw —
    переменная окружения или `--token-file <файл>`. Если токен всё же
    прислали в чат, предложи перевыпустить его в @BotFather (`/revoke`).
 3. `$SP setup` показывает бота, находит владельца по «Старт» и сохраняет его

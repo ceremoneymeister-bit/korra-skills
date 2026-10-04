@@ -940,7 +940,7 @@ def test_token_file_errors_do_not_fall_through(tmp_path):
 def test_no_token_gives_russian_instructions(capsys):
     assert sp.main(["info", "x"]) == 1
     err = capsys.readouterr().err
-    for word in ("@BotFather", "Старт", "STICKER_BOT_TOKEN", "Пользовательские ключи", "~/.hermes/.env", "в чат"):
+    for word in ("@BotFather", "Старт", "STICKER_BOT_TOKEN", "Пользовательские ключи", "$HERMES_HOME", "в чат"):
         assert word in err
 
 
