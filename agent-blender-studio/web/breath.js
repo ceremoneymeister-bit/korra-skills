@@ -57,7 +57,8 @@ color=vec4(col,1.);}`;
   function resize(){stop();const r=hero.getBoundingClientRect(),d=Math.min(devicePixelRatio||1,2);canvas.width=Math.round(r.width*d);canvas.height=Math.round(r.height*d);}
   function frame(now){
     raf=0;if(!ready||reduce.matches||!visible||document.hidden||gl.isContextLost())return;
-    const dt=Math.min((now-last)/1000,.05);last=now;let active=false;
+    // The first rAF timestamp may precede performance.now() from the input event.
+    const dt=Math.max(1/240,Math.min((now-last)/1000,.05));last=now;let active=false;
     for(let i=0;i<N;i++){const target=now-touched[i]<650?1:0;levels[i]+=(target-levels[i])*Math.min(1,dt*(target?8:3));if(levels[i]<.002&&target===0)levels[i]=0;if(levels[i]>0)active=true;}
     if(!active){stop();return;}
     const r=hero.getBoundingClientRect(),b=word.getBoundingClientRect(),mx=m.margins[0],my=m.margins[1];
