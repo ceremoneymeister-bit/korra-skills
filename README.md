@@ -11,6 +11,7 @@ Open agent skills by the Korra team (Agent Skills format; instructions in Russia
 |---|---|---|
 | [mac-care](mac-care/) | Удалённый аудит Mac и согласованные настройки силами агента; кандидат 0.1.0, живая приёмка впереди | [Библиотека Korra](https://korra-agent.online/library/mac-care/) |
 | [telegram-emoji-packs](telegram-emoji-packs/) | Эмодзи-паки и стикерпаки Telegram через своего бота: из своих картинок и видео или из чужих паков; правки, порядок, превью | [Библиотека Korra](https://korra-agent.online/library/telegram-emoji-packs/) |
+| [agent-blender-studio](agent-blender-studio/) | SVG и логотипы → объёмные предметы, материалы, рендеры и три эффекта для сайта | [Библиотека Korra](https://korra-agent.online/library/agent-blender-studio/) |
 
 ## Установка
 
