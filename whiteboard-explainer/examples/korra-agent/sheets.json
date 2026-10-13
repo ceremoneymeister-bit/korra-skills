@@ -1,0 +1,10 @@
+{
+  "grid": [3, 2],
+  "sheets": {
+    "s1.png": ["robot", "person", "cloud", "phone", "laptop", "server"],
+    "s2.png": ["clipboard", "notebook", "folder", "checklist", "toolbox", "docseal"],
+    "s3.png": ["mail", "calendar", "sheet", "picture", "doc", "mic"],
+    "s4.png": ["clock", "plane", "correction", "designer", "secretary", "analyst"]
+  },
+  "hand": "s5.png"
+}

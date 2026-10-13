@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Как устроен агент Korra — доска</title>
+<!--
+  Одна доска 5760×3240. Каждый .el рисуется отдельно в порядке документа:
+    data-d    — сколько секунд рисуется элемент;
+    data-gap  — пауза перед ним (по умолчанию 0.1);
+    data-mode — engine (движок whiteboard-animator) или path (по пути SVG);
+    data-layer — 0 доска, 1 финальная карточка поверх белой вуали.
+  Камера и вуаль — в #timeline, ссылки на элементы по id.
+-->
+<style>
+@font-face { font-family: Caveat; src: url(assets/fonts/Caveat.ttf); font-weight: 400 700; }
+html, body { margin: 0; background: #fff; }
+#board { position: relative; width: 5760px; height: 4800px; overflow: hidden; background: #fff; }
+.el { position: absolute; }
+img.el { display: block; }
+.t { font-family: Caveat; font-weight: 700; color: #1f1f1f; white-space: nowrap; line-height: 1; }
+.cap { font-size: 130px; }
+.sub { font-size: 86px; font-weight: 600; line-height: 1.08; }
+.head { font-size: 170px; }
+.c { transform: translateX(-50%); text-align: center; }
+.r { text-align: right; }
+svg.el { left: 0; top: 0; width: 5760px; height: 3240px; overflow: visible; }
+.ink { fill: none; stroke: #1f1f1f; stroke-width: 16; stroke-linecap: round; stroke-linejoin: round; }
+.lime { fill: none; stroke: #9ede01; stroke-width: 26; stroke-linecap: round; }
+.hl { fill: none; stroke: #dfe8c2; stroke-width: 150; stroke-linecap: round; }
+.btn { font-family: Caveat; font-weight: 700; font-size: 66px; color: #1f1f1f; white-space: nowrap;
+       border: 9px solid #1f1f1f; border-radius: 34px; padding: 10px 34px 14px; line-height: 1; }
+.btn.ok { background: #9ede01; }
+.btn.no { background: #fff; }
+.num { font-family: Caveat; font-weight: 700; font-size: 92px; color: #1f1f1f; width: 124px; height: 124px;
+       border: 9px solid #1f1f1f; border-radius: 50%; background: #9ede01; box-sizing: border-box;
+       display: flex; align-items: center; justify-content: center; line-height: 1; padding-bottom: 8px; }
+</style>
+</head>
+<body>
+<div id="board">
+
+<!-- ═══ 1. Заголовок и агент ═══ -->
+<div class="el t" id="title" data-d="1.6" data-gap="0.15" style="left:220px; top:120px; font-size:250px">КАК УСТРОЕН АГЕНТ KORRA</div>
+<svg class="el" id="title-line" data-mode="path" data-d="0.45"><path class="lime" d="M 240 425 C 1000 400, 1900 435, 2960 405"/></svg>
+
+<img class="el" id="agent" src="assets/icons/robot.png" data-d="1.5" data-gap="0.9" style="left:3247px; top:1080px; height:800px">
+<div class="el t cap c" id="agent-cap" data-d="0.6" style="left:3550px; top:1885px; font-size:180px">АГЕНТ</div>
+
+<!-- ═══ 2. Вы и каналы ═══ -->
+<img class="el" id="you" src="assets/icons/person.png" data-d="1.2" data-gap="0.9" style="left:300px; top:1300px; height:640px">
+<div class="el t c" id="you-cap" data-d="0.5" style="left:568px; top:1950px; font-size:220px">ВЫ</div>
+<img class="el" id="phone" src="assets/icons/phone.png" data-d="0.8" data-gap="0.4" style="left:200px; top:2380px; height:420px">
+<div class="el t cap c" id="phone-cap" data-d="0.6" style="left:323px; top:2830px; font-size:120px">Telegram</div>
+<img class="el" id="laptop" src="assets/icons/laptop.png" data-d="0.8" style="left:600px; top:2440px; height:330px">
+<div class="el t cap c" id="laptop-cap" data-d="0.6" style="left:826px; top:2830px; font-size:120px">кабинет</div>
+<div class="el t sub c" id="channels-sub" data-d="0.8" style="left:600px; top:2990px; font-size:96px">текст, голос, файлы</div>
+<svg class="el" id="you-arrow" data-mode="path" data-d="1.1" data-gap="0.7"><path class="ink" d="M 920 1985 C 1700 2010, 2500 1960, 3190 1960 M 3128 1910 L 3195 1960 L 3130 2012 M 985 1935 L 918 1985 L 984 2036"/></svg>
+
+<!-- ═══ 3. Модель ═══ -->
+<img class="el" id="cloud" src="assets/icons/cloud.png" data-d="1.1" data-gap="0.85" style="left:3200px; top:110px; height:480px">
+<div class="el t" id="model-cap" data-d="0.7" style="left:3980px; top:105px; font-size:200px">МОДЕЛЬ</div>
+<div class="el t sub" id="model-sub1" data-d="1.0" style="left:3990px; top:330px; font-size:118px">ChatGPT или Claude</div>
+<div class="el t sub" id="model-sub2" data-d="0.9" style="left:3990px; top:460px; font-size:118px">по вашей подписке</div>
+<svg class="el" id="model-line" data-mode="path" data-d="0.9" data-gap="0.3"><path class="ink" d="M 3550 1090 L 3550 640 M 3505 690 L 3550 635 L 3595 690 M 3505 1040 L 3550 1095 L 3595 1040" stroke-dasharray="44 30"/></svg>
+<div class="el t sub" id="model-sub3" data-d="1.0" style="left:3650px; top:700px; font-size:92px">получает запрос и нужный контекст</div>
+
+<!-- ═══ 4. Что он знает ═══ -->
+<div class="el t head" id="knows-head" data-d="0.9" data-gap="0.85" style="left:1650px; top:1075px">ЧТО ОН ЗНАЕТ</div>
+<img class="el" id="role" src="assets/icons/clipboard.png" data-d="0.65" data-gap="0.2" style="left:1730px; top:1290px; height:230px">
+<div class="el t cap c" id="role-cap" data-d="0.5" style="left:1840px; top:1540px; font-size:108px">РОЛЬ</div>
+<div class="el t sub c" id="role-sub" data-d="0.85" style="left:1840px; top:1670px; font-size:80px">что делает<br>и как себя ведёт</div>
+<img class="el" id="memory" src="assets/icons/notebook.png" data-d="0.65" data-gap="0.2" style="left:2250px; top:1290px; height:230px">
+<div class="el t cap c" id="memory-cap" data-d="0.6" style="left:2380px; top:1540px; font-size:108px">ПАМЯТЬ</div>
+<div class="el t sub c" id="memory-sub" data-d="0.85" style="left:2380px; top:1670px; font-size:80px">короткие<br>важные факты</div>
+<img class="el" id="materials" src="assets/icons/folder.png" data-d="0.65" data-gap="0.2" style="left:2765px; top:1290px; height:230px">
+<div class="el t cap c" id="materials-cap" data-d="0.7" style="left:2890px; top:1540px; font-size:108px">МАТЕРИАЛЫ</div>
+<div class="el t sub c" id="materials-sub" data-d="0.85" style="left:2890px; top:1670px; font-size:80px">прайс, регламенты,<br>документы</div>
+
+<!-- ═══ 5. Что он умеет ═══ -->
+<div class="el t head" id="can-head" data-d="0.9" data-gap="0.85" style="left:4030px; top:1075px">ЧТО ОН УМЕЕТ</div>
+<img class="el" id="skills" src="assets/icons/checklist.png" data-d="0.65" data-gap="0.2" style="left:4150px; top:1290px; height:230px">
+<div class="el t cap c" id="skills-cap" data-d="0.6" style="left:4245px; top:1540px; font-size:120px">НАВЫКИ</div>
+<div class="el t sub c" id="skills-sub" data-d="0.85" style="left:4245px; top:1670px; font-size:80px">порядок работы<br>по шагам</div>
+<img class="el" id="tools" src="assets/icons/toolbox.png" data-d="0.65" data-gap="0.2" style="left:4830px; top:1300px; height:220px">
+<div class="el t cap c" id="tools-cap" data-d="0.8" style="left:5000px; top:1540px; font-size:120px">ИНСТРУМЕНТЫ</div>
+<div class="el t sub c" id="tools-sub" data-d="0.85" style="left:5000px; top:1670px; font-size:80px">действия, которые<br>ему разрешены</div>
+<img class="el" id="t-mail" src="assets/icons/mail.png" data-d="0.22" data-gap="0.3" style="left:4120px; top:1915px; height:110px">
+<img class="el" id="t-cal" src="assets/icons/calendar.png" data-d="0.22" data-gap="0.05" style="left:4340px; top:1890px; height:150px">
+<img class="el" id="t-sheet" src="assets/icons/sheet.png" data-d="0.22" data-gap="0.05" style="left:4540px; top:1900px; height:130px">
+<img class="el" id="t-pic" src="assets/icons/picture.png" data-d="0.22" data-gap="0.05" style="left:4770px; top:1900px; height:130px">
+<img class="el" id="t-doc" src="assets/icons/doc.png" data-d="0.22" data-gap="0.05" style="left:5010px; top:1885px; height:155px">
+<img class="el" id="t-mic" src="assets/icons/mic.png" data-d="0.22" data-gap="0.05" style="left:5190px; top:1885px; height:155px">
+<div class="el t sub c" id="tools-list" data-d="1.1" data-gap="0.2" style="left:4750px; top:2075px; font-size:80px">Google, файлы, картинки, голос</div>
+
+<!-- ═══ 6. Как он работает ═══ -->
+<div class="el t head" id="work-head" data-d="0.9" data-gap="0.85" style="left:1650px; top:2270px">КАК ОН РАБОТАЕТ</div>
+<img class="el" id="w-result" src="assets/icons/docseal.png" data-d="0.6" data-gap="0.3" style="left:1830px; top:2470px; height:270px">
+<div class="el t cap c" id="w-result-cap" data-d="0.6" style="left:2050px; top:2760px; font-size:110px">НА ПРОВЕРКУ</div>
+<div class="el btn ok c" id="w-accept" data-d="0.7" data-gap="0.2" style="left:2050px; top:2885px">Принять результат</div>
+<div class="el btn no c" id="w-return" data-d="0.7" data-gap="0.1" style="left:2050px; top:3010px">Вернуть с замечанием</div>
+<img class="el" id="w-send" src="assets/icons/plane.png" data-d="0.6" data-gap="0.4" style="left:2840px; top:2500px; height:220px">
+<div class="el t cap c" id="w-send-cap" data-d="0.7" style="left:3040px; top:2760px; font-size:110px">РАЗОВЫЕ СООБЩЕНИЯ</div>
+<div class="el t sub c" id="w-send-sub" data-d="0.95" style="left:3040px; top:2890px; font-size:80px">уходят людям только после<br>вашего «Отправить»</div>
+<img class="el" id="w-clock" src="assets/icons/clock.png" data-d="0.6" data-gap="0.55" style="left:3915px; top:2470px; height:270px">
+<div class="el t cap c" id="w-clock-cap" data-d="0.7" style="left:4050px; top:2760px; font-size:110px">ПО РАСПИСАНИЮ</div>
+<div class="el t sub c" id="w-clock-sub" data-d="0.95" style="left:4050px; top:2890px; font-size:80px">присылает результат<br>сам, без вас</div>
+<img class="el" id="w-fix" src="assets/icons/correction.png" data-d="0.6" data-gap="0.4" style="left:4855px; top:2480px; height:250px">
+<div class="el t cap c" id="w-fix-cap" data-d="0.7" style="left:5040px; top:2760px; font-size:110px">ИСПРАВЛЕНИЯ</div>
+<div class="el t sub c" id="w-fix-sub" data-d="0.95" style="left:5040px; top:2890px; font-size:80px">«как было» → «как правильно»<br>становится правилом</div>
+
+<!-- ═══ 7. Как проходит одно поручение — полоса под доской ═══ -->
+<div class="el t head" id="flow-head" data-d="0.8" data-gap="1.5" style="left:300px; top:3655px; font-size:140px">КАК ПРОХОДИТ ОДНО ПОРУЧЕНИЕ</div>
+<div class="el num" id="f1-num" data-d="0.25" data-gap="0.3" style="left:300px; top:3850px">1</div>
+<img class="el" id="f1-icon" src="assets/icons/person.png" data-d="0.6" data-gap="0.05" style="left:462px; top:3880px; height:330px">
+<div class="el t cap c" id="f1-cap" data-d="0.55" data-gap="0.1" style="left:600px; top:4250px; font-size:106px">ВЫ ПИШЕТЕ</div>
+<svg class="el" id="f-a12" data-mode="path" data-d="0.35" data-gap="0.1"><path class="lime" d="M 800 4045 L 1370 4045 M 1322 4003 L 1376 4045 L 1322 4087"/></svg>
+<div class="el num" id="f2-num" data-d="0.25" data-gap="0.05" style="left:1420px; top:3850px">2</div>
+<img class="el" id="f2-icon" src="assets/icons/robot.png" data-d="0.6" data-gap="0.05" style="left:1525px; top:3880px; height:330px">
+<img class="el" id="f2-role" src="assets/icons/clipboard.png" data-d="0.25" data-gap="0.05" style="left:1805px; top:3895px; height:150px">
+<img class="el" id="f2-memory" src="assets/icons/notebook.png" data-d="0.25" data-gap="0.05" style="left:1795px; top:4065px; height:135px">
+<div class="el t cap c" id="f2-cap" data-d="0.6" data-gap="0.1" style="left:1730px; top:4250px; font-size:106px">АГЕНТ ГОТОВИТСЯ</div>
+<div class="el t sub c" id="f2-sub" data-d="0.75" data-gap="0.1" style="left:1730px; top:4390px; font-size:86px">роль и память;<br>материалы — когда нужны</div>
+<svg class="el" id="f-a23" data-mode="path" data-d="0.35" data-gap="0.1"><path class="lime" d="M 1985 4045 L 2625 4045 M 2577 4003 L 2631 4045 L 2577 4087"/></svg>
+<div class="el num" id="f3-num" data-d="0.25" data-gap="0.05" style="left:2580px; top:3850px">3</div>
+<img class="el" id="f3-icon" src="assets/icons/cloud.png" data-d="0.6" data-gap="0.05" style="left:2690px; top:3905px; height:280px">
+<div class="el t cap c" id="f3-cap" data-d="0.55" data-gap="0.1" style="left:2885px; top:4250px; font-size:106px">МОДЕЛЬ РЕШАЕТ</div>
+<div class="el t sub c" id="f3-sub" data-d="0.6" data-gap="0.1" style="left:2885px; top:4390px; font-size:86px">что делать<br>дальше</div>
+<svg class="el" id="f-a34" data-mode="path" data-d="0.35" data-gap="0.75"><path class="lime" d="M 3110 4045 L 3845 4045 M 3797 4003 L 3851 4045 L 3797 4087"/></svg>
+<div class="el num" id="f4-num" data-d="0.25" data-gap="0.05" style="left:3740px; top:3850px">4</div>
+<img class="el" id="f4-icon" src="assets/icons/toolbox.png" data-d="0.6" data-gap="0.05" style="left:3885px; top:3925px; height:260px">
+<div class="el t cap c" id="f4-cap" data-d="0.6" data-gap="0.1" style="left:4040px; top:4250px; font-size:106px">ИНСТРУМЕНТЫ ДЕЛАЮТ</div>
+<div class="el t sub c" id="f4-sub" data-d="0.6" data-gap="0.1" style="left:4040px; top:4390px; font-size:86px">почта, таблицы,<br>файлы</div>
+<svg class="el" id="f-loop" data-mode="path" data-d="0.6" data-gap="0.2"><path class="lime" d="M 4000 3880 C 3800 3700, 3260 3690, 3040 3855 M 3046 3780 L 3036 3860 L 3116 3858"/></svg>
+<div class="el t sub c" id="f-loop-cap" data-d="0.8" data-gap="0.05" style="left:3520px; top:3625px; font-size:86px">шаг за шагом, пока не готово</div>
+<svg class="el" id="f-a45" data-mode="path" data-d="0.35" data-gap="0.15"><path class="lime" d="M 4230 4045 L 4975 4045 M 4927 4003 L 4981 4045 L 4927 4087"/></svg>
+<div class="el num" id="f5-num" data-d="0.25" data-gap="0.05" style="left:4860px; top:3850px">5</div>
+<img class="el" id="f5-icon" src="assets/icons/docseal.png" data-d="0.6" data-gap="0.05" style="left:5030px; top:3880px; height:330px">
+<div class="el t cap c" id="f5-cap" data-d="0.55" data-gap="0.1" style="left:5160px; top:4250px; font-size:106px">РЕЗУЛЬТАТ — ВАМ</div>
+<div class="el t sub c" id="f5-sub" data-d="0.45" data-gap="0.1" style="left:5160px; top:4390px; font-size:86px">на проверку</div>
+
+<!-- ═══ 8. Ваш сервер — главный момент ═══ -->
+<svg class="el" id="server-box" data-mode="path" data-d="2.0" data-gap="1.9"><path class="ink" stroke-width="20" d="M 1600 1020 L 5520 1020 Q 5600 1020 5600 1100 L 5600 3090 Q 5600 3170 5520 3170 L 1580 3170 Q 1500 3170 1500 3090 L 1500 1100 Q 1500 1020 1580 1020 Z"/></svg>
+<svg class="el" id="server-hl" data-mode="path" data-d="0.4" data-gap="0.2"><path class="hl" d="M 1995 640 L 2905 630"/></svg>
+<img class="el" id="server" src="assets/icons/server.png" data-d="0.7" data-gap="0.05" style="left:1645px; top:540px; height:250px">
+<div class="el t" id="server-cap" data-d="0.8" style="left:1955px; top:525px; font-size:200px">ВАШ СЕРВЕР</div>
+<div class="el t sub" id="server-sub" data-d="1.3" style="left:1965px; top:765px; font-size:100px">файлы, память и настройки — у вас</div>
+
+<!-- ═══ 9. Команда и логотип (поверх вуали) ═══ -->
+<img class="el" id="team-designer" src="assets/icons/designer.png" data-layer="1" data-d="0.75" data-gap="2.2" style="left:1390px; top:700px; height:1150px">
+<img class="el" id="team-agent" src="assets/icons/robot.png" data-layer="1" data-d="0.75" data-gap="0.1" style="left:2450px; top:600px; height:1250px">
+<img class="el" id="team-secretary" src="assets/icons/secretary.png" data-layer="1" data-d="0.75" data-gap="0.1" style="left:3560px; top:700px; height:1150px">
+<div class="el t c" id="team-cap" data-layer="1" data-d="1.2" data-gap="0.2" style="left:2880px; top:1950px; font-size:200px">Агентов может быть несколько</div>
+<div class="el t sub c" id="team-sub" data-layer="1" data-d="0.9" data-gap="0.1" style="left:2880px; top:2180px; font-size:140px">у каждого своя роль</div>
+<img class="el" id="logo" src="assets/korra-wordmark.svg" data-layer="1" data-d="1.0" data-gap="0.6" style="left:1830px; top:2500px; width:2100px">
+<div class="el t c" id="slogan" data-layer="1" data-d="1.0" data-gap="0.2" style="left:2880px; top:2880px; font-size:150px">Поручайте. Принимайте результат.</div>
+
+</div>
+
+<script type="application/json" id="timeline">
+{
+  "canvas": [5760, 4800],
+  "card_window": [2880, 1620, 5760],
+  "output": "agent-explainer.mp4",
+  "previews": [{"name": "board", "y": 0, "w": 5760, "h": 3240},
+               {"name": "flow", "y": 3540, "w": 5760, "h": 1100}],
+  "fps": 30,
+  "end_hold": 2.0,
+  "camera": [
+    {"at": "start", "x": 1595, "y": 280, "w": 3000},
+    {"at": "agent", "lead": 0.75, "move": 1.05, "x": 3550, "y": 1590, "w": 2200},
+    {"at": "you", "lead": 0.75, "move": 1.05, "x": 600, "y": 2197, "w": 3500},
+    {"at": "you-arrow", "lead": 0.55, "move": 0.75, "x": 2050, "y": 2050, "w": 3900},
+    {"at": "cloud", "lead": 0.7, "move": 1.0, "x": 4330, "y": 760, "w": 2650},
+    {"at": "knows-head", "lead": 0.7, "move": 1.0, "x": 2765, "y": 1600, "w": 2400},
+    {"at": "can-head", "lead": 0.7, "move": 1.0, "x": 4465, "y": 1640, "w": 2500},
+    {"at": "work-head", "lead": 0.7, "move": 1.0, "x": 2600, "y": 2862, "w": 2300},
+    {"at": "w-clock", "lead": 0.45, "move": 0.6, "x": 4630, "y": 2862, "w": 2100},
+    {"at": "flow-head", "lead": 1.2, "move": 1.15, "x": 1790, "y": 4110, "w": 3300},
+    {"at": "f-a34", "lead": 0.55, "move": 0.75, "x": 4060, "y": 4110, "w": 3300},
+    {"at": "server-box", "lead": 1.7, "move": 1.7, "x": 2880, "y": 1620, "w": 6000}
+  ],
+  "veil": {"at": "team-designer", "lead": 0.9, "dur": 0.7, "alpha": 0.95}
+}
+</script>
+</body>
+</html>

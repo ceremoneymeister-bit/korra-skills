@@ -1,0 +1,4 @@
+out/
+sheets/
+__pycache__/
+.venv/
