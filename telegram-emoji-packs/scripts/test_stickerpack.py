@@ -1786,3 +1786,408 @@ def test_sheet_frames_tgs(tmp_path, monkeypatch, capsys):
     assert capsys.readouterr().err.count("pip install rlottie-python") == 1
     with Image.open(out) as im:
         assert im.size == sp.strip_sheet_size(1, 5)
+
+
+# ------------------------------------- прозрачность, кадры при >30 к/с, --from-set, custom_emoji_id
+
+needs_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="нужен ffmpeg")
+
+
+def make_alpha_clip(path, fps, total, size=100):
+    """WEBM VP9 с альфой: верхняя половина кадра прозрачна, снизу красный квадрат смещается по кадрам."""
+    from PIL import Image
+    frames = path.parent / (path.stem + "_png")
+    frames.mkdir()
+    for i in range(total):
+        im = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        im.paste(Image.new("RGBA", (size // 2, size // 2), (255, 0, 0, 255)), (i % (size // 2), size // 2))
+        im.save(frames / f"f_{i}.png")
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-framerate", str(fps), "-i", str(frames / "f_%d.png"),
+                    "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", str(path)], check=True)
+
+
+def first_frame_transparency(path):
+    """Доля прозрачных пикселей первого кадра, декодированного libvpx-vp9 (встроенный декодер альфу теряет)."""
+    from PIL import Image
+    out = path.parent / (path.stem + "_first.png")
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-c:v", "libvpx-vp9", "-i", str(path), "-frames:v", "1",
+                    "-pix_fmt", "rgba", str(out)], check=True)
+    with Image.open(out) as im:
+        a = im.getchannel("A").tobytes()
+    return sum(1 for v in a if v < 8) / len(a)
+
+
+@needs_ffmpeg
+def test_prepare_vp9_keeps_alpha(tmp_path):
+    src = tmp_path / "alpha.webm"
+    make_alpha_clip(src, 25, 10, size=128)
+    before = first_frame_transparency(src)
+    assert 0.7 < before < 0.8
+    rc, out = run_prepare(tmp_path, [src], "emoji")
+    assert rc == 0
+    res = out / "alpha.webm"
+    assert sp.validate_file(res, "emoji") == []
+    assert abs(first_frame_transparency(res) - before) < 0.1
+
+
+@needs_ffmpeg
+def test_prepare_33fps_keeps_every_frame_and_alpha(tmp_path, capsys):
+    src = tmp_path / "clip33.webm"
+    make_alpha_clip(src, 33, 10)
+    assert sp.validate_file(src, "emoji")  # 33 к/с > 30
+    before = first_frame_transparency(src)
+    capsys.readouterr()
+    rc, out = run_prepare(tmp_path, [src], "emoji")
+    assert rc == 0
+    res = out / "clip33.webm"
+    assert sp.validate_file(res, "emoji") == []
+    facts = sp.video_facts(res)
+    assert facts["frames"] == 10 and abs(facts["fps"] - 30) < 0.01
+    assert 0.333 - 0.01 < facts["duration"] < 0.333 + 0.01
+    assert abs(first_frame_transparency(res) - before) < 0.1
+    assert "33 к/с → 30, кадры сохранены" in capsys.readouterr().out
+
+
+@needs_ffmpeg
+def test_prepare_fast_or_long_clips_still_drop_frames(tmp_path, capsys):
+    long_clip = tmp_path / "long36.webm"
+    make_alpha_clip(long_clip, 36, 120, size=64)  # 120 кадров при 30 к/с = 4 с > 3 с
+    fast_clip = tmp_path / "fast60.webm"
+    make_alpha_clip(fast_clip, 60, 30, size=64)  # 60 → 30 вдвое замедлило бы ролик
+    capsys.readouterr()
+    for src in (long_clip, fast_clip):
+        rc, out = run_prepare(tmp_path, [src], "emoji")
+        assert rc == 0
+        res = out / f"{src.stem}.webm"
+        assert sp.validate_file(res, "emoji") == []
+        facts = sp.video_facts(res)
+        assert facts["duration"] <= 3.0 and abs(facts["fps"] - 30) < 0.01
+    assert sp.video_facts(tmp_path / "out" / "fast60.webm")["frames"] == 15  # fps=30, а не замедление
+    assert "часть кадров пропущена" in capsys.readouterr().out
+
+
+def record_ffmpeg(monkeypatch):
+    calls = []
+    real = subprocess.run
+
+    def fake(cmd, *a, **k):
+        if cmd and cmd[0] == "ffmpeg" and "-vf" in cmd:
+            calls.append(list(cmd))
+        return real(cmd, *a, **k)
+
+    monkeypatch.setattr(sp.subprocess, "run", fake)
+    return calls
+
+
+@needs_ffmpeg
+def test_prepare_decodes_vp9_with_libvpx_before_input(tmp_path, monkeypatch):
+    src = tmp_path / "a.webm"
+    make_alpha_clip(src, 33, 10)
+    calls = record_ffmpeg(monkeypatch)
+    sp.prepare_animated(src, tmp_path / "o.webm", "emoji")
+    cmd = calls[0]
+    i = cmd.index("-i")
+    assert cmd[i - 2:i] == ["-c:v", "libvpx-vp9"]
+    vf = cmd[cmd.index("-vf") + 1]
+    assert "setpts=N/(30*TB)" in vf and "fps=" not in vf and "format=rgba" in vf
+    assert cmd[cmd.index("-r") + 1] == "30"
+
+
+@needs_ffmpeg
+def test_prepare_works_without_libvpx_decoder(tmp_path, monkeypatch):
+    src = tmp_path / "a.webm"
+    make_alpha_clip(src, 25, 10, size=128)
+    monkeypatch.setattr(sp, "has_ffmpeg_decoder", lambda name: False)
+    calls = record_ffmpeg(monkeypatch)
+    out = tmp_path / "o.webm"
+    sp.prepare_animated(src, out, "emoji")
+    cmd = calls[0]
+    assert cmd[:cmd.index("-i")].count("-c:v") == 0  # как раньше: без явного декодера
+    assert sp.validate_file(out, "emoji") == []
+
+
+def test_has_ffmpeg_decoder_parses_listing(monkeypatch):
+    class R:
+        stdout = (" V..... vp9_v4l2m2m          V4L2 wrapper (codec vp9)\n"
+                  " V..... libvpx-vp9           libvpx VP9 (codec vp9)\n")
+
+    monkeypatch.setattr(sp, "_DECODER_CACHE", {})
+    monkeypatch.setattr(sp.subprocess, "run", lambda *a, **k: R())
+    assert sp.has_ffmpeg_decoder("libvpx-vp9") is True
+    assert sp.has_ffmpeg_decoder("libvpx") is False
+    monkeypatch.setattr(sp, "_DECODER_CACHE", {})
+
+    def boom(*a, **k):
+        raise FileNotFoundError
+
+    monkeypatch.setattr(sp.subprocess, "run", boom)
+    assert sp.has_ffmpeg_decoder("libvpx-vp9") is False
+
+
+@needs_ffmpeg
+def test_video_frame_count_sources(tmp_path):
+    clip = tmp_path / "c.webm"
+    make_alpha_clip(clip, 33, 10, size=64)
+    assert sp.video_frame_count(clip, {"nb_frames": "7"}, 0.3, 33) == 7  # nb_frames контейнера в приоритете
+    assert sp.video_frame_count(clip, {"nb_read_frames": "8"}, 0.3, 33) == 8
+    assert sp.video_frame_count(clip, {}, 0.303, 33) == 10  # посчитано через -count_frames
+    assert sp.video_frame_count(tmp_path / "нет.webm", {}, 0.303, 33) == 10  # оценка по длительности
+
+
+@needs_ffmpeg
+def test_probe_returns_nb_frames_and_skips_recount(tmp_path, monkeypatch):
+    mp4 = tmp_path / "c.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=64x64:rate=33",
+                    "-frames:v", "10", "-pix_fmt", "yuv420p", str(mp4)], check=True)
+    info = sp.probe(mp4)
+    stream = next(s for s in info["streams"] if s["codec_type"] == "video")
+    assert stream["nb_frames"] == "10"
+    calls = []
+    real = sp.probe
+    monkeypatch.setattr(sp, "probe", lambda *a, **k: calls.append(k) or real(*a, **k))
+    assert sp.video_frame_count(mp4, stream, 0.303, 33) == 10
+    assert calls == []  # nb_frames контейнера есть — повторный probe с count_frames не нужен
+
+
+class MediaApi(FakeApi):
+    """FakeApi с настоящими байтами файлов для --from-set: blobs[file_id] → (байты, расширение)."""
+    def __init__(self):
+        super().__init__()
+        self.blobs = {}
+
+    def download(self, file_id):
+        return self.blobs[file_id]
+
+    def add_media_set(self, name, items, kind="custom_emoji"):
+        """items: [(байты, расширение, emoji)]."""
+        stickers = []
+        for i, (data, ext, emoji) in enumerate(items, 1):
+            fid = f"{name}-f{i}"
+            self.blobs[fid] = (data, ext)
+            stickers.append({"file_id": fid, "file_unique_id": f"{name}-u{i}", "custom_emoji_id": f"{name}-c{i}",
+                             "emoji": emoji, "is_video": ext == ".webm", "is_animated": ext == ".tgs"})
+        self.sets[name] = {"title": name, "type": kind, "stickers": stickers}
+
+
+def uploaded_files(api, tmp_path):
+    out = []
+    for n, up in enumerate(api.uploads.values()):
+        p = tmp_path / f"uploaded_{n}.{'webm' if up['fmt'] == 'video' else 'webp'}"
+        p.write_bytes(up["data"])
+        out.append(p)
+    return out
+
+
+@needs_ffmpeg
+def test_add_from_set_prepares_downloaded_files_and_dedupes(work, capsys):
+    from PIL import Image
+    tmp, files = work
+    api = MediaApi()
+    ok = tmp / "ok.webm"
+    make_alpha_clip(ok, 30, 10)
+    fast = tmp / "fast.webm"
+    make_alpha_clip(fast, 33, 10)
+    big = io.BytesIO()
+    Image.new("RGBA", (300, 200), (10, 200, 10, 255)).save(big, "WEBP")
+    api.add_media_set("Src", [(ok.read_bytes(), ".webm", "😀"), (fast.read_bytes(), ".webm", "😁"),
+                              (big.getvalue(), ".webp", "🦀")])
+    assert run(tmp, api, "create", "demo", "--title", "T", "--kind", "emoji", "--files", str(files[0])) == 0
+    capsys.readouterr()
+    assert run(tmp, api, "add", "demo", "--from-set", "Src:1-3") == 0
+    lines = [l for l in capsys.readouterr().out.splitlines() if "приведён" in l]
+    assert len(lines) == 2 and "Src#2" in lines[0] and "33 к/с → 30, кадры сохранены" in lines[0]
+    assert "Src#3" in lines[1] and all("Src#1" not in l for l in lines)  # годный файл не трогали
+    assert names(api) == ["⭐", "😀", "😁", "🦀"]
+    items = pack_state(tmp)["items"]
+    assert [i["source"] for i in items[1:]] == ["set:Src#1", "set:Src#2", "set:Src#3"]
+    assert items[2]["src_md5"] == hashlib.md5(fast.read_bytes()).hexdigest()  # md5 скачанного оригинала
+    assert "prepared" in items[2]["src"] and Path(items[2]["src"]).is_file()
+    for p in uploaded_files(api, tmp)[1:]:
+        assert sp.validate_file(p, "emoji") == []
+    assert run(tmp, api, "add", "demo", "--from-set", "Src:1-3") == 0
+    assert "всё уже добавлено" in capsys.readouterr().out
+    assert len(api.sets["demo_by_testbot"]["stickers"]) == 4
+
+
+@needs_ffmpeg
+def test_create_from_set_keeps_emoji_and_alpha(work):
+    tmp, files = work
+    api = MediaApi()
+    fast = tmp / "fast.webm"
+    make_alpha_clip(fast, 33, 10)
+    before = first_frame_transparency(fast)
+    api.add_media_set("Src", [(fast.read_bytes(), ".webm", "😁")])
+    assert run(tmp, api, "create", "copy", "--title", "C", "--kind", "emoji", "--from-set", "Src:1") == 0
+    assert names(api, "copy_by_testbot") == ["😁"]
+    (up,) = uploaded_files(api, tmp)
+    assert abs(first_frame_transparency(up) - before) < 0.1
+    assert sp.video_facts(up)["frames"] == 10
+
+
+@needs_ffmpeg
+def test_create_from_set_dry_run_prepares_but_creates_nothing(work, capsys):
+    tmp, files = work
+    api = MediaApi()
+    fast = tmp / "fast.webm"
+    make_alpha_clip(fast, 33, 10)
+    api.add_media_set("Src", [(fast.read_bytes(), ".webm", "😁")])
+    capsys.readouterr()
+    assert run(tmp, api, "create", "copy", "--title", "C", "--kind", "emoji", "--from-set", "Src:1", "--dry-run") == 0
+    assert "приведён" in capsys.readouterr().out
+    assert "copy_by_testbot" not in api.sets and "uploadStickerFile" not in api.log
+
+
+@needs_ffmpeg
+def test_own_files_are_not_prepared_silently(work, capsys):
+    tmp, files = work
+    fast = tmp / "fast.webm"
+    make_alpha_clip(fast, 33, 10)
+    api = MediaApi()
+    capsys.readouterr()
+    assert run(tmp, api, "create", "demo", "--title", "T", "--kind", "emoji", "--files", str(fast)) == 1
+    out = capsys.readouterr()
+    assert "prepare" in out.err and "кадров/с" in out.err and "приведён" not in out.out
+    assert "uploadStickerFile" not in api.log
+
+
+def test_from_set_tgs_is_not_converted_and_error_is_clear(work, capsys):
+    tmp, files = work
+    api = MediaApi()
+    api.add_media_set("Src", [(b"not gzip", ".tgs", "🎬")])
+    capsys.readouterr()
+    assert run(tmp, api, "create", "copy", "--title", "C", "--kind", "emoji", "--from-set", "Src:1") == 1
+    err = capsys.readouterr().err
+    assert "gzip" in err and "TGS не конвертируется" in err
+    assert "uploadStickerFile" not in api.log
+
+
+def test_from_set_good_tgs_passes_untouched(work):
+    tmp, files = work
+    api = MediaApi()
+    data = gzip.compress(b'{"v":"5"}')
+    api.add_media_set("Src", [(data, ".tgs", "🎬")])
+    assert run(tmp, api, "create", "copy", "--title", "C", "--kind", "emoji", "--from-set", "Src:1") == 0
+    assert next(iter(api.uploads.values()))["data"] == data
+
+
+def test_from_set_static_is_prepared(work, capsys):
+    from PIL import Image
+    tmp, files = work
+    api = MediaApi()
+    buf = io.BytesIO()
+    Image.new("RGBA", (300, 200), (10, 200, 10, 255)).save(buf, "WEBP")
+    api.add_media_set("Src", [(buf.getvalue(), ".webp", "🦀")])
+    assert run(tmp, api, "create", "copy", "--title", "C", "--kind", "emoji", "--from-set", "Src:1") == 0
+    assert "приведён" in capsys.readouterr().out
+    (up,) = uploaded_files(api, tmp)
+    assert sp.validate_file(up, "emoji") == []
+    assert pack_state(tmp, "copy_by_testbot")["items"][0]["src_md5"] == hashlib.md5(buf.getvalue()).hexdigest()
+
+
+# --------------------------------------------------------------- identify по custom_emoji_id
+
+CUSTOM_ID = "5368324170671202286"
+
+
+def identify_api(custom_ids):
+    api = FakeApi()
+    api.sets["Src"] = {"title": "Src", "type": "custom_emoji", "stickers": [
+        {"file_id": f"f{i}", "file_unique_id": f"u{i}", "custom_emoji_id": cid, "emoji": "💬"}
+        for i, cid in enumerate(custom_ids, 1)]}
+    orig = api.call
+
+    def call(method, params=None, files=None):
+        if method == "getCustomEmojiStickers":
+            return [{"custom_emoji_id": i, "set_name": "Src", "emoji": "💬"}
+                    for i in params["custom_emoji_ids"] if i in custom_ids]
+        return orig(method, params, files)
+
+    api.call = call
+    return api
+
+
+def test_collect_file_ids_accepts_numeric_custom_emoji_ids(tmp_path):
+    d = tmp_path / "ids"
+    d.mkdir()
+    (d / f"{CUSTOM_ID}.webm").write_bytes(b"x")
+    (d / "12345678901234.webm").write_bytes(b"x")  # 14 цифр — не custom_emoji_id
+    fid = next(iter(VECTORS))
+    assert sp.collect_file_ids([CUSTOM_ID, "12345678901234", "1" * 20, fid]) == [CUSTOM_ID, "1" * 20, fid]
+    assert sp.collect_file_ids([str(d)]) == [CUSTOM_ID]
+    assert sp.collect_file_ids([str(d / f"{CUSTOM_ID}.webm")]) == [CUSTOM_ID]
+
+
+def test_identify_by_custom_emoji_id_prints_pack_position_and_hint(tmp_path, capsys):
+    other = "5368324170671202999"
+    api = identify_api(["111", other, "222", CUSTOM_ID, "333"])
+    capsys.readouterr()
+    assert run(tmp_path, api, "identify", CUSTOM_ID, other) == 0
+    out = capsys.readouterr().out
+    assert "Src #4" in out and "Src #2" in out
+    assert "позиции в паке 2,4" in out
+    assert "--from-set Src:2,4" in out
+
+
+def test_identify_custom_emoji_id_mixed_with_file_id(tmp_path, capsys):
+    fid, cid = next(iter(VECTORS.items()))
+    api = identify_api([str(cid), CUSTOM_ID])
+    capsys.readouterr()
+    assert run(tmp_path, api, "identify", fid, CUSTOM_ID) == 0
+    assert "--from-set Src:1-2" in capsys.readouterr().out
+
+
+def test_identify_unknown_custom_emoji_id(tmp_path, capsys):
+    api = identify_api(["111"])
+    capsys.readouterr()
+    assert run(tmp_path, api, "identify", CUSTOM_ID) == 0
+    assert "не найден" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------- справка
+
+def help_text(capsys, *argv):
+    with pytest.raises(SystemExit):
+        sp.main([*argv, "--help"])
+    return " ".join(capsys.readouterr().out.split())
+
+
+def test_help_texts(capsys):
+    for cmd in ("add", "create"):
+        text = help_text(capsys, cmd)
+        assert "каждому файлу" in text and "emoji --pos" in text
+    text = help_text(capsys, "compare")
+    assert "другой пак" in text and "чуж" not in text
+    assert "чуж" not in help_text(capsys) + help_text(capsys, "identify")
+    assert "custom_emoji_id" in help_text(capsys, "identify")
+
+
+class DownloadableMediaApi(MediaApi):
+    """MediaApi, который отдаёт и загруженные в Telegram файлы (preview скачивает перекодированную версию)."""
+    def download(self, file_id):
+        if file_id in self.blobs:
+            return self.blobs[file_id]
+        for up in self.uploads.values():
+            h = int(hashlib.md5(up["data"]).hexdigest()[:15], 16)
+            if file_id == f"fid{h}":
+                return up["data"], ".webm" if up["fmt"] == "video" else ".webp"
+        raise AssertionError(file_id)
+
+
+@needs_ffmpeg
+def test_preview_recovery_keeps_original_md5_and_dedupe(tmp_path):
+    api = DownloadableMediaApi()
+    clip = tmp_path / "fast33.webm"
+    make_alpha_clip(clip, 33, 10)
+    original_md5 = hashlib.md5(clip.read_bytes()).hexdigest()
+    api.add_media_set("Src", [(clip.read_bytes(), ".webm", "😁")])
+    assert run(tmp_path, api, "create", "demo", "--title", "T", "--kind", "emoji", "--from-set", "Src") == 0
+    item = pack_state(tmp_path)["items"][0]
+    assert item["src_md5"] == original_md5
+    Path(item["src"]).unlink()
+    assert run(tmp_path, api, "preview", "demo") == 0
+    restored = pack_state(tmp_path)["items"][0]
+    assert Path(restored["src"]).is_file()
+    assert restored["src_md5"] == original_md5  # md5 оригинала не затёрт md5 скачанной перекодированной версии
+    before = len(names(api))
+    assert run(tmp_path, api, "add", "demo", "--from-set", "Src") == 0
+    assert len(names(api)) == before == 1

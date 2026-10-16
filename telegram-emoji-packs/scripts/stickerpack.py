@@ -50,6 +50,7 @@ STATIC_EXT = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 VIDEO_EXT = {".gif", ".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"}
 ALL_EXT = STATIC_EXT | VIDEO_EXT | {".tgs"}
 FILE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{20,}$")
+CUSTOM_EMOJI_ID_RE = re.compile(r"^\d{15,20}$")
 
 MUTATING_METHODS = {
     "createNewStickerSet", "addStickerToSet", "deleteStickerFromSet", "setStickerPositionInSet",
@@ -507,7 +508,7 @@ def decode_file_id(file_id: str) -> dict:
 
 def probe(path: Path, count_frames: bool = False) -> dict:
     cmd = ["ffprobe", "-v", "error", "-show_entries",
-           "stream=codec_type,codec_name,width,height,avg_frame_rate,r_frame_rate,nb_read_frames"
+           "stream=codec_type,codec_name,width,height,avg_frame_rate,r_frame_rate,nb_frames,nb_read_frames"
            ":format=duration", "-of", "json"]
     if count_frames:
         cmd.insert(3, "-count_frames")
@@ -717,11 +718,47 @@ def _frames_from_pillow(src: Path, tmp: Path) -> tuple[Path, float]:
     return tmp / "f_%05d.png", min(MAX_FPS, 1000.0 / max(avg, 1))
 
 
-def prepare_animated(src: Path, out: Path, kind: str) -> None:
+_DECODER_CACHE: dict[str, bool] = {}
+RETIME_MAX_RATIO = 1.25  # переложить кадры без пропусков можно, если ролик при этом замедляется не сильнее, чем на 25 %
+
+
+def has_ffmpeg_decoder(name: str) -> bool:
+    if name not in _DECODER_CACHE:
+        try:
+            out = subprocess.run(["ffmpeg", "-hide_banner", "-decoders"], capture_output=True, text=True,
+                                 errors="ignore").stdout
+        except FileNotFoundError:
+            out = ""
+        _DECODER_CACHE[name] = re.search(rf"^\s*V\S*\s+{re.escape(name)}\s", out, re.M) is not None
+    return _DECODER_CACHE[name]
+
+
+def video_frame_count(src: Path, stream: dict, duration: float | None, fps: float) -> int:
+    """nb_frames контейнера, иначе nb_read_frames (-count_frames), иначе оценка по длительности."""
+    for key in ("nb_frames", "nb_read_frames"):
+        if str(stream.get(key) or "").isdigit() and int(stream[key]) > 0:
+            return int(stream[key])
+    estimate = round((duration or 0) * fps)
+    if estimate > MAX_DURATION * 60:  # длинный ролик: считать кадры незачем, всё равно не уложится
+        return estimate
+    try:
+        counted = probe(src, count_frames=True)
+        v = next(s for s in counted.get("streams", []) if s.get("codec_type") == "video")
+        if str(v.get("nb_read_frames") or "").isdigit() and int(v["nb_read_frames"]) > 0:
+            return int(v["nb_read_frames"])
+    except (CliError, StopIteration):
+        pass
+    return estimate
+
+
+def prepare_animated(src: Path, out: Path, kind: str) -> str:
+    """Готовит WEBM для Telegram. Возвращает пометку о смене частоты кадров («33 к/с → 30, кадры сохранены»)
+    или пустую строку."""
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         in_args: list[str]
         src_fps: float
+        frames: int | None = None
         ext = src.suffix.lower()
         if ext in {".webp", ".png"}:
             pattern, fps = _frames_from_pillow(src, tmp)
@@ -734,8 +771,18 @@ def prepare_animated(src: Path, out: Path, kind: str) -> None:
             if not v:
                 raise CliError(f"{src.name}: нет видеопотока")
             in_args = ["-i", str(src)]
+            if v.get("codec_name") == "vp9" and has_ffmpeg_decoder("libvpx-vp9"):
+                # встроенный VP9-декодер ffmpeg отбрасывает альфа-канал, libvpx-vp9 — нет
+                in_args = ["-c:v", "libvpx-vp9", *in_args]
             src_fps = _rate(v.get("avg_frame_rate")) or _rate(v.get("r_frame_rate"))
             w, h = v["width"], v["height"]
+            if MAX_FPS + 0.01 < src_fps <= MAX_FPS * RETIME_MAX_RATIO:
+                try:
+                    dur = float(info.get("format", {}).get("duration"))
+                except (TypeError, ValueError):
+                    dur = None
+                frames = video_frame_count(src, v, dur, src_fps)
+        retime = frames is not None and 0 < frames / MAX_FPS <= MAX_DURATION + 0.001
         tw, th = _target_size(w, h, kind)
         scale = f"scale={tw}:{th}:flags=lanczos"
         if kind == "emoji":
@@ -744,9 +791,13 @@ def prepare_animated(src: Path, out: Path, kind: str) -> None:
             vf_tail = scale
         stages = [(30, 30), (30, 38), (30, 46), (30, 54), (24, 56), (15, 58), (12, 63)]
         for cap, crf in stages:
-            fps_filter = f"fps={cap}," if src_fps > cap + 0.01 else ""
+            keep_frames = retime and cap == 30
+            if keep_frames:
+                fps_filter, out_rate = f"setpts=N/({cap}*TB),", ["-r", str(cap)]
+            else:
+                fps_filter, out_rate = (f"fps={cap}," if src_fps > cap + 0.01 else ""), []
             vf = f"{fps_filter}format=rgba,{vf_tail},format=yuva420p"
-            cmd = ["ffmpeg", "-v", "error", "-y", *in_args, "-t", "3", "-an", "-sn", "-vf", vf,
+            cmd = ["ffmpeg", "-v", "error", "-y", *in_args, "-t", "3", "-an", "-sn", "-vf", vf, *out_rate,
                    "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-b:v", "0", "-crf", str(crf),
                    "-auto-alt-ref", "0", "-deadline", "good", "-cpu-used", "4", "-row-mt", "1",
                    str(out)]
@@ -758,7 +809,11 @@ def prepare_animated(src: Path, out: Path, kind: str) -> None:
             except FileNotFoundError:
                 raise MissingToolError(f"ffmpeg не найден — {FFMPEG_HINT}") from None
             if out.stat().st_size <= MAX_WEBM_BYTES:
-                return
+                if keep_frames:
+                    return f"{src_fps:g} к/с → {cap}, кадры сохранены"
+                if src_fps > cap + 0.01:
+                    return f"{src_fps:g} к/с → {cap}, часть кадров пропущена"
+                return ""
         raise CliError(f"{src.name}: не удалось уложиться в 256 КБ даже при максимальном сжатии")
 
 
@@ -807,7 +862,7 @@ def human_size(n: int) -> str:
 def cmd_prepare(ctx, a) -> int:
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    rows, failed, meta_items, used = [], 0, [], set()
+    rows, failed, meta_items, used, notes = [], 0, [], set(), []
     trim = not a.no_trim
     for f in a.files:
         src = Path(f)
@@ -829,7 +884,9 @@ def cmd_prepare(ctx, a) -> int:
                 shutil.copy2(src, dst)
             elif is_animated_source(src):
                 dst = unique_path(out, src.stem, ".webm", used)
-                prepare_animated(src, dst, a.kind)
+                note = prepare_animated(src, dst, a.kind)
+                if note:
+                    notes.append(f"  {src.name}: {note}")
             else:
                 dst = unique_path(out, src.stem, ".webp", used)
                 orig, trimmed = prepare_static(src, dst, a.kind, trim=trim, pad=a.pad)
@@ -861,6 +918,8 @@ def cmd_prepare(ctx, a) -> int:
             print(f"{r[0]:<{w}}  → {r[1]}")
         else:
             print(f"{r[0]:<{w}}  | {r[4]} | {r[5]} | {r[6]} | → {r[1]}  | {r[2]} | {r[3]}")
+    for n in notes:
+        print(n)
     if meta_items:
         (out / "meta.json").write_text(json.dumps({"items": meta_items}, ensure_ascii=False, indent=1))
     print(f"\nготово: {len(rows) - failed} из {len(rows)} в {out}")
@@ -985,10 +1044,16 @@ def md5_of(path: Path) -> str:
 
 
 class Src:
-    def __init__(self, path: Path, emoji: str, source: str):
+    def __init__(self, path: Path, emoji: str, source: str, downloaded: bool = False):
         self.path, self.emoji, self.source = Path(path), emoji, source
+        self.downloaded = downloaded
         self.fmt = format_of(self.path)
-        self.md5 = md5_of(self.path)
+        self.md5 = md5_of(self.path)  # md5 скачанного/заданного файла: по нему add не задваивает элементы
+
+    def replace_file(self, path: Path) -> None:
+        """Подставляет приведённый файл; emoji, source и md5 исходника остаются прежними."""
+        self.path = Path(path)
+        self.fmt = format_of(self.path)
 
     def meta(self) -> dict:
         return {"src": str(self.path.resolve()), "source": self.source, "src_md5": self.md5}
@@ -1019,7 +1084,7 @@ def download_set(ctx, ref: str, files_dir: Path) -> list[Src]:
         data, ext = ctx.api.download(st["file_id"])
         path = files_dir / f"{name}_{pos:03d}{ext}"
         path.write_bytes(data)
-        srcs.append(Src(path, st.get("emoji") or "⭐", f"set:{name}#{pos}"))
+        srcs.append(Src(path, st.get("emoji") or "⭐", f"set:{name}#{pos}", downloaded=True))
     return srcs
 
 
@@ -1061,13 +1126,44 @@ def pending_sources(state_items: list[dict], srcs: list[Src]) -> list[Src]:
     return todo
 
 
+def autoprepare_downloaded(srcs: list[Src], kind: str) -> None:
+    """Файлы, скачанные из пака (--from-set), приводит к требованиям Telegram тем же кодом, что prepare.
+    TGS не трогает (у него свои правила), свои файлы (--files, --from-dir) — тоже."""
+    for s in srcs:
+        if not s.downloaded or s.path.suffix.lower() == ".tgs":
+            continue
+        bad = validate_file(s.path, kind)
+        if not bad:
+            continue
+        prepared_dir = s.path.parent / "prepared"
+        prepared_dir.mkdir(exist_ok=True)
+        try:
+            if is_animated_source(s.path):
+                dst = prepared_dir / f"{s.path.stem}.webm"
+                note = prepare_animated(s.path, dst, kind)
+            else:
+                dst = prepared_dir / f"{s.path.stem}.webp"
+                prepare_static(s.path, dst, kind)
+                note = ""
+        except CliError as e:
+            raise CliError(f"{s.path.name} ({s.source}): не удалось привести к требованиям Telegram: {e}") from None
+        s.replace_file(dst)
+        why = "; ".join(bad) + (f"; {note}" if note else "")
+        print(f"  ⇄ {s.source}: приведён к требованиям Telegram ({why})")
+
+
 def check_sources(srcs: list[Src], kind: str) -> None:
     problems = []
+    has_tgs = False
     for s in srcs:
         for b in validate_file(s.path, kind):
             problems.append(f"  {s.path.name}: {b}")
+            has_tgs = has_tgs or s.path.suffix.lower() == ".tgs"
     if problems:
-        raise CliError("файлы не подходят под требования Telegram (приведите через prepare):\n"
+        hint = "приведите через prepare"
+        if has_tgs:
+            hint += "; TGS не конвертируется — замените такой файл другим"
+        raise CliError(f"файлы не подходят под требования Telegram ({hint}):\n"
                        + "\n".join(problems[:30]) + (f"\n  …ещё {len(problems) - 30}" if len(problems) > 30 else ""))
 
 
@@ -1103,6 +1199,7 @@ def cmd_create(ctx, a) -> int:
     try:
         files_dir = Path(dry_td.name) if dry_td else ctx.pack_dir(name) / "files"
         srcs = resolve_sources(ctx, a.sources, a.emoji, files_dir)
+        autoprepare_downloaded(srcs, kind)
         check_sources(srcs, kind)
         remote = ctx.api.get_set(name, missing_ok=True)
         state = load_state(ctx, name) if remote else None
@@ -1143,6 +1240,7 @@ def cmd_add(ctx, a) -> int:
     if state is None:
         remote, state = refresh(ctx, name)
     srcs = resolve_sources(ctx, a.sources, a.emoji, ctx.pack_dir(name) / "files")
+    autoprepare_downloaded(srcs, kind)
     check_sources(srcs, kind)
     todo = pending_sources(state["items"], srcs)
     before = len(remote["stickers"])
@@ -1443,7 +1541,7 @@ def collect_file_ids(inputs: list[str]) -> list[str]:
     def add(token: str):
         token = token.strip()
         stem = Path(token).stem if "." in Path(token).name else token
-        if FILE_ID_RE.match(stem) and stem not in ids:
+        if (CUSTOM_EMOJI_ID_RE.match(stem) or FILE_ID_RE.match(stem)) and stem not in ids:
             ids.append(stem)
 
     for raw in inputs:
@@ -1467,11 +1565,11 @@ def collect_file_ids(inputs: list[str]) -> list[str]:
 def cmd_identify(ctx, a) -> int:
     ids = collect_file_ids(a.inputs)
     if not ids:
-        raise CliError("не найдено ни одного file_id (архив/каталог/имя файла/строка)")
+        raise CliError("не найдено ни одного file_id или custom_emoji_id (архив/каталог/имя файла/строка)")
     decoded: dict[str, int] = {}
     for fid in ids:
         try:
-            decoded[fid] = decode_file_id(fid)["id"]
+            decoded[fid] = int(fid) if CUSTOM_EMOJI_ID_RE.match(fid) else decode_file_id(fid)["id"]
         except CliError as e:
             print(f"  ⚠ {e}", file=sys.stderr)
     uniq = list(dict.fromkeys(str(v) for v in decoded.values()))
@@ -1501,6 +1599,7 @@ def cmd_identify(ctx, a) -> int:
     print()
     for sname, pos in positions.items():
         print(f"{sname}: {len(pos)} из {len(ids)}, позиции в паке {compress_ranges(pos)} (всего в паке {len(sets[sname])})")
+        print(f"  добавить к себе: add ПАК --from-set {sname}:{compress_ranges(pos)}")
     return 0
 
 
@@ -2114,7 +2213,9 @@ def ensure_local_sources(ctx, name: str, remote: dict, state: dict) -> bool:
         data, ext = ctx.api.download(remote["stickers"][i]["file_id"])
         path = files_dir / f"{item_key(it)}{ext}"
         path.write_bytes(data)
-        it["src"], it["src_md5"] = str(path), hashlib.md5(data).hexdigest()
+        it["src"] = str(path)
+        if not it.get("src_md5"):  # после автоприведения там md5 оригинала — по нему работает дедупликация
+            it["src_md5"] = hashlib.md5(data).hexdigest()
         changed = True
     return changed
 
@@ -2220,20 +2321,23 @@ def build_parser() -> argparse.ArgumentParser:
     add("whoami", "бот (username, id) и доступность владельца", cmd_whoami)
     sp = add("info", "название, тип, форматы и список элементов набора", cmd_info)
     sp.add_argument("set", help="имя набора или ссылка t.me/addemoji/…")
-    sp = add("identify", "узнать исходный пак по file_id (архив-выгрузка, каталог, имена файлов, строки)", cmd_identify,
+    sp = add("identify", "узнать исходный пак по file_id или custom_emoji_id (архив-выгрузка, каталог, имена файлов, строки)",
+             cmd_identify,
              "Имена файлов/каталогов в выгрузках — Bot API file_id. Для custom emoji id документа = custom_emoji_id,\n"
-             "по нему находится исходный набор и позиция в нём.")
-    sp.add_argument("inputs", nargs="+", help="zip, каталог, файл или file_id")
+             "по нему находится исходный набор и позиция в нём. Можно сразу дать custom_emoji_id — десятичное число\n"
+             "из 15–20 цифр (в entities сообщения с эмодзи: type=custom_emoji). Для каждого найденного пака\n"
+             "печатается подсказка `add ПАК --from-set пак:позиции`.")
+    sp.add_argument("inputs", nargs="+", help="zip, каталог, файл, file_id или custom_emoji_id")
     sp = add("fetch", "скачать файлы набора (NNN.ext) и meta.json", cmd_fetch,
              "Пример: fetch AIByVolodya --out /tmp/pack   или   fetch AIByVolodya:1,5-9 --out /tmp/pack")
     sp.add_argument("set", help="имя набора, можно с выбором позиций: имя:1,3,5-9")
     sp.add_argument("--out", required=True, help="каталог для файлов")
-    sp = add("compare", "сравнить чужой пак со своим: повторы побайтно, новые номера, картинки", cmd_compare,
+    sp = add("compare", "сравнить другой пак со своим: повторы побайтно, новые номера, картинки", cmd_compare,
              "Источник — имя/ссылка пака (скачивается как fetch) или каталог после fetch. Для каждого элемента:\n"
              "«повтор №K» (файл совпал побайтно с исходником K-го элемента своего пака), «повтор внутри источника №M»\n"
              "или «новое». Похожие, но не побайтные анимации скрипт не угадывает: смотрите полоски (--sheet).\n"
              "Итог «новых N из M: 3,5-9» подходит для add ПАК --from-set ИСТОЧНИК:3,5-9. Записывает compare.json.")
-    sp.add_argument("source", help="имя/ссылка чужого пака (можно имя:выбор) или каталог после fetch")
+    sp.add_argument("source", help="имя/ссылка другого пака (можно имя:выбор) или каталог после fetch")
     sp.add_argument("--with", dest="with_pack", required=True, metavar="ПАК", help="свой пак (короткое имя, имя или ссылка)")
     sp.add_argument("--out", metavar="КАТАЛОГ", help="куда скачать источник и писать compare.json "
                                                      "(по умолчанию <каталог>/compare/<имя>)")
@@ -2263,7 +2367,9 @@ def build_parser() -> argparse.ArgumentParser:
                             help="все файлы каталога по имени (с meta.json от fetch/prepare берутся emoji)")
         sp.add_argument("--from-set", action=SourceAction, metavar="НАБОР[:PICK]",
                         help="взять из набора, напр. AIByVolodya:1,3,5-9; можно повторять")
-        sp.add_argument("--emoji", default="⭐", help="emoji для файлов без meta.json (по умолчанию ⭐; несколько — через запятую)")
+        sp.add_argument("--emoji", default="⭐", help="emoji для файлов без meta.json (по умолчанию ⭐). Список через запятую ставится каждому "
+                             "файлу: «😁,😬» — оба эмодзи на каждом. Разные эмодзи разным файлам — "
+                             "потом `emoji --pos`")
         sp.set_defaults(sources=[])
 
     sp = add("create", "создать набор и добавить элементы (повторный запуск продолжает, не дублируя)", cmd_create,
